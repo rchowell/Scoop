@@ -1,0 +1,8 @@
+build:
+    pnpm exec tsp compile scoop.tsp
+
+format:
+    pnpm exec tsp format "**/*.tsp"
+
+clean:
+    rm -rf ./build

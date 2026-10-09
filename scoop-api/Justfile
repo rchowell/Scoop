@@ -1,0 +1,12 @@
+default:
+    @just --list
+
+# Run the API dev server on http://localhost:8000 (docs at /docs)
+run:
+    uv run --env-file ../.env fastapi dev api/main.py --port 8000
+
+codegen: && format
+    uv run datamodel-codegen
+
+format:
+    uv run ruff format

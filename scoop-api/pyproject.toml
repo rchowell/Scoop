@@ -1,0 +1,39 @@
+[project]
+name = "scoop-api"
+version = "0.1.0"
+description = "Scoop API service"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=1.12.1",
+    "duckdb>=1.5.6",
+    "fastapi[standard]>=0.142.4",
+    "psycopg[binary]>=3.2",
+    "pydantic",
+    "pymysql>=1.1",
+    "sqlglot>=30.21.0",
+]
+
+[dependency-groups]
+dev = [
+    "datamodel-code-generator>=0.83.0",
+    "pytest",
+    "ruff>=0.16.10",
+    "testcontainers[mysql,postgres]>=4",
+]
+
+[tool.datamodel-codegen]
+input = "../scoop-types/build/@typespec/openapi3/openapi.yaml"
+input-file-type = "openapi"
+output = "models.py"
+output-model-type = "pydantic_v2.BaseModel"
+target-python-version = "3.11"
+snake-case-field = true
+field-constraints = true
+capitalize-enum-members = true
+allow-extra-fields = true
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: end-to-end HTTP tests against every connector backend (starts Docker containers)",
+]
