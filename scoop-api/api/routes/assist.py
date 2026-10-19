@@ -14,7 +14,7 @@ router = APIRouter(prefix="/v1/connectors", tags=["assist"])
 
 def _sse(events: Iterator[AssistEvent]) -> Iterator[str]:
     for event in events:
-        yield f"event: {event.type}\ndata: {event.model_dump_json()}\n\n"
+        yield f"event: {event.type}\ndata: {event.model_dump_json(by_alias=True)}\n\n"
 
 
 @router.post("/{id}/generate")

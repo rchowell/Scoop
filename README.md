@@ -12,13 +12,21 @@ schemas, tables, and execute queries.
 The project is structured in three parts,
 
 ```
-scoop-api/      # FastAPI server and database connectors
+scoop-api/      # FastAPI server, database connectors, and SQL dialects
 scoop-app/      # NextJS application a'la PgAdmin
-scoop-types/    # TypeSpec definitions for all APIs & Models
+scoop-types/    # TypeSpec definitions for all APIs & Models, plus the query AST
+warehouse/      # Sample NYC yellow-taxi data (yellow.duckdb, yellow.parquet)
 ```
 
-The project uses `just` for simplified command running, you can start each
-component with `just run` and you'll get the following,
+The project uses `just` for simplified command running. From the repo root,
+
+```
+just setup      # Install dependencies for all three packages
+just codegen    # Compile the TypeSpec, then regenerate the API models and app types
+just docker     # (Re)start the Postgres + MySQL test container on :15432 / :13306
+```
+
+Then you can start each component with `just run` and you'll get the following,
 
 ```
 cd scoop-api && just run        # listening on :8000
@@ -30,11 +38,13 @@ cd scoop-app && just run        # listening on :3000
 Scoop is able to connect to diverse database backends by means of a single
 `Connector` abstraction. This interface allows the HTTP API layer to work
 against a shared interface, while the actual implementation for Postgres and
-MySQL differs greatly. You will notice that this is the same pattern used by
-JDBC. Here is the `Connector` definition.
+MySQL differs. You will notice that this is the same pattern used by JDBC. Here
+is the `Connector` definition.
 
 ```python
 class Connector(ABC):
+    dialect: ClassVar[Dialect]  # Connector's SQL dialect
+
     @abstractmethod
     def list_tables(self, namespace: TablePath = ()) -> list[TablePath]:
         """List tables and views whose path starts with `namespace`."""
@@ -43,9 +53,19 @@ class Connector(ABC):
     def get_table(self, path: TablePath) -> Table:
         """Describe a table or view; raises TableNotFoundError if it doesn't exist."""
 
+    def execute(self, query: Query, *, page_size: int = 1000) -> Result:
+        """Run `query`, returning pages of at most `page_size` rows."""
+        sql, params = self.dialect.compile(query)  # convert 'Query' structure to dialect-specific SQL
+        cursor = self._cursor()
+        cursor.execute(sql, params)
+        return Cursor(cursor, page_size, self._type_name)
+
     @abstractmethod
-    def execute(self, query: str, params: Params = None, *, page_size: int = 1000) -> Result:
-        """Run `query` with DB-API style `params`, returning pages of at most `page_size` rows."""
+    def _cursor(self) -> Any:
+        """A fresh DB-API 2.0 cursor."""
+
+    @abstractmethod
+    def close(self) -> None: ...
 ```
 
 The `list_tables` and `get_table` APIs allow us to query the information_schema
@@ -54,9 +74,10 @@ of the backing database to render the schema and tables in the UI via a
 since this is not standardized to two-level.
 
 The more interesting method here is the `execute` method. The `execute` method
-takes a query string and returns a `Result` object which is an iterator of
-`Page`. I chose a columnar layout for the page so that we need not repeat column
-names in each row and bloat the JSON.
+takes a `Query` AST (not a SQL string), compiles it to SQL plus bound parameters
+using the connector's `Dialect`, runs it on a DB-API cursor, and returns a
+`Result` object which is an iterator of `Page`. I chose a columnar layout for
+the page so that we need not repeat column names in each row and bloat the JSON.
 
 ```python
 @dataclass(frozen=True)
@@ -88,23 +109,31 @@ class Result(ABC, Iterator[Page]):
 ```
 
 This `Connector` interface allows us to write per-database implementations which
-need only implement a few methods. You can see them all in these files,
+need only set a `dialect` and implement `list_tables`, `get_table`, `_cursor`,
+and `close`. You can see them all in these files,
 
 ```
-connector/
-    base.py
-    duckdb.py
-    mysql.py
-    postgres.py
-    sqlite.py
+api/
+    connector/
+        base.py         # Connector, Result, ConnectorFactory
+        duckdb.py
+        mysql.py
+        postgres.py
+        sqlite.py
+        registry.py     # Factories keyed by kind
+    sql/
+        dialect.py      # ANSI SQL Dialect visitor
+        dialects.py     # Per-backend overrides
+        doc.py          # Wadler-style layout tree and renderer
+    visitor.py          # Visitor base class for the query AST
 ```
 
 We have a unified way to query with connectors, but how do we actually
 instantiate the connectors? This is where the `ConnectorFactory` comes in. The
-`ConnectorFactory` is responisble for unifying the instantiation of connectors
-to a single interface; a `ConnectorFactory` receives an abitrary dict of options
-(JSON) and instantiates a connector instance. For example, here's the postgres
-connector factory.
+`ConnectorFactory` is responsible for unifying the instantiation of connectors
+to a single interface; a `ConnectorFactory` receives an arbitrary dict of
+options (JSON) and instantiates a connector instance. For example, here's the
+postgres connector factory.
 
 ```python
 class PostgresConnectorFactory(ConnectorFactory):
@@ -128,7 +157,7 @@ class PostgresConnectorFactory(ConnectorFactory):
 ```
 
 This abstraction pays off in two ways. First, we can make a registry of all
-factories and create an HTTP API to list all availablel connectors. Beacuse we
+factories and create an HTTP API to list all available connectors. Because we
 have the `options()` method, then our UI can render all the options as a form.
 Second, we can save all options JSON into the application database along with
 the connector kind. Then when a query comes in we can check a `ConnectorCache`
@@ -136,8 +165,55 @@ to see if we have an active connection, otherwise we can use the connector kind
 discriminant to lookup the factory in the registry, then use the options to
 instantiate the connector.
 
-All the HTTP APIs, defined in `scoop-types/scoop.tsp` - we have Connector CRUD
-then we have the Connector APIs as HTTP APIs.
+### Queries
+
+Queries are represented as a universal `Query` AST defined in
+`scoop-types/ast.tsp` and generated into Pydantic models. The AST is a
+deliberately minimal, supporting the basic clauses like:
+
+- `SELECT [DISTINCT]`
+- `FROM` with joins and derived tables,
+- `WHERE`
+- `GROUP BY`
+- `HAVING`
+- `ORDER BY` (with `NULLS FIRST/LAST`)
+- `LIMIT/OFFSET`
+
+Then common expressions such as:
+
+  - `CASE WHEN`
+  - `CAST`
+  - `IN`
+  - `BETWEEN`
+  - `LIKE`
+  - `IS NULL`
+  - `COALESCE`
+  - `NULLIF`
+
+Turning the AST into SQL is a traversal, so `visitor.py` provides a
+`Visitor[C, R]` base class. The generated nodes are closed classes on which we
+cannot author an `accept` method, so the visitor dispatches on node type with
+`functools.singledispatchmethod`. State flows down the traversal through a
+context `ctx: C` and back up through the return value `R`.
+
+The `Dialect` in `dialect.py` is a visitor that renders ANSI SQL. It does not
+build strings directly; it returns a Wadler-style `Doc` layout tree (`doc.py`)
+which is then rendered to fit a line width, so the generated SQL comes out
+pretty-printed. Every literal is bound as a parameter rather than inlined, so
+`compile` returns both the SQL and its parameters.
+
+```python
+sql, params = PostgresDialect().compile(query)
+```
+
+Each connector declares its dialect, e.g. `dialect = PostgresDialect()`, and the
+shared `Connector.execute` uses the dialect to compile to the correct SQL
+before executing on the connector's backend.
+
+### HTTP APIs
+
+All the HTTP APIs are defined in `scoop-types/scoop.tsp` - we have Connector
+CRUD then we have the Connector APIs as HTTP APIs.
 
 ```
 GET    /v1/health                    # Service health and version
@@ -149,12 +225,12 @@ PATCH  /v1/connectors/{id}           # Update a connector
 DELETE /v1/connectors/{id}           # Delete a connector
 GET    /v1/connectors/{id}/tables    # List tables and views under a namespace
 GET    /v1/connectors/{id}/table     # Describe a table or view
-POST   /v1/connectors/{id}/execute   # Run a query, returning columnar rows
+POST   /v1/connectors/{id}/execute   # Run a Query AST, returning columnar rows
 POST   /v1/connectors/{id}/generate  # Generate SQL from a prompt (SSE stream)
 ```
 
 The connections API returns a list of all supported connectors along with their
-options. The UI does NOT hardcoded any connector information and it's all dynamic
+options. The UI does NOT hardcode any connector information and it's all dynamic
 based on the available connectors.
 
 ![connectors](screenshots/connectors.png)
@@ -162,17 +238,18 @@ based on the available connectors.
 The connector creation saves the connector and its options into the database,
 then when we call `execute` we lookup the connector `id` in an object cache. If
 the connector is missing from the cache, we instantiate it using the respective
-factory. The `execute` API then sends the query to the connector which returns
-that `Result` object before. The HTTP layer converts the Result object into a
-`Page` of JSON results which the UI renders.
+factory. The `execute` API then sends the `Query` AST to the connector, which
+compiles it with its dialect and returns the `Result` object described above.
+The HTTP layer converts the `Result` object into a `Page` of JSON results which
+the UI renders.
 
 Finally there are end-to-end integration tests against the Docker image containing
-the Postgres and MySQL Northwind databases. These integration tests use the HTTP
-API to test the full system.
+the Postgres and MySQL Northwind databases (start it with `just docker`). These
+integration tests use the HTTP API to test the full system.
 
 ## Prompts
 
-- describing your major prompts and where you redirected the AI
+These are my major prompts and where I redirected the AI.
 
 1. Connector Interface
 
@@ -199,7 +276,7 @@ registry into the plan and I approved that.
 
 3. HTTP APIs
 
-> Look at connector.py and determine a minimal set of HTTP APIs for Connector CRUD and then interactions with connectors at their scoped endpoints. Each connector will have a UUID so we can address it like '/v1'connector/<uuid>/execute/'
+> Look at connector.py and determine a minimal set of HTTP APIs for Connector CRUD and then interactions with connectors at their scoped endpoints. Each connector will have a UUID so we can address it like '/v1/connector/<uuid>/execute/'
 
 Comments: Once I had the python APIs good, I knew it would be easy for Claude to
 raise a set of HTTP APIs. I had already setup the `scoop-types` package with the
@@ -232,6 +309,62 @@ was enough to get a useable application shell. I followed-up by stating to
 explore the APIs and recognize this is a PgAdmin like application. That seed was
 enough to get a first pass at the UI, with some nudging on where to put
 connectors and using a filetree for showing the schemas+tables.
+
+6. Generate AST
+
+> Create an ast.tsp file which is imported by our main .tsp -- we should for now just put a simple
+  expression ast in this and ensure we get model compilation wired end-to-end. I want to inspect the
+  python ast models.
+
+Comments: I did this to get the AST wired up and to ensure the generated models
+were in a shape that I was happy with. Once I liked the setup, then I went for
+a minimal AST that still covers a substantial set of functional SQL.
+
+> I want the AST to be a minimal subset of SQL that covers the most number of basic features. We need
+> the following clauses:
+>
+> - select
+> - from
+> - where
+> - group by
+> - having
+> - limit/offset
+>
+> Then we should have the ANSI-SQL standard expressions include case-when, coalesce, nullif, etc. Use
+> the pareto principle to determine a minimal set of features with maximum coverage. We do NOT need a
+> complete SQL AST.
+
+
+7. Visitor Setup
+
+See visitor.py -- it's nice!
+
+> In scoop-api/api create a 'visitor.py' which is an abstract base class Visitor for the AST. This should use functools dispatch along with parameterized context (ctx: C) and return R.
+> Like, visit_node(node: Node, ctx: C) -> R
+> Include a test_visitor.py which implements the abc and tests the dispatch for the pattern over all AST nodes.
+
+Comments: For SQL translation, I want to traverse the AST. In an OO language
+like python with closed objects like the generated AST nodes, this calls for the
+visitor pattern. I used a python trick for dispatching on types since we cannot
+author an `accept` method on the generated nodes. This allows me to author a
+top-level visit method which dispatches to different methods based on node type
+without having to go through the objects. I use a context variable and typed
+returned because this completes all ways to pass state in a traversal, either
+up the call stack via returns or down the call stack via ctx -- both work great
+without having to keep any state outside the traversal.
+
+
+8. SQL Dialects
+
+>  I want you to author a 'Dialect' visitor in a new 'sql' module which is an implementation of the
+  Visitor which pretty-prints SQL. It should use a Wadler-style intermediate data structure for layout.
+  We must also be able to do per-dialect overrides.
+
+Comments: To turn the AST back into dialect-specific SQL, we can use our visitor
+and have it return a string. I wanted a Wadler pretty-printer so that we can get
+some pretty-printing; this basically takes the AST and puts it into a 'document'
+tree which then is rendered to a string.
+
 
 ## Future Work
 
@@ -267,13 +400,20 @@ SQL types are JSON-serializable such as BLOBs. Also, SQL has INTs 128-bit which
 are larger than JSON INT (64-bit) yet I made no attempt to have robust value
 encoding. Of course, it's mostly good and in 45 minutes it did the trick.
 
-5. Param Placeholders
+5. User-Supplied Parameters
 
-Each backend uses different syntax for parameters like `?` vs. `$1` and making
-a universal solution was too large of a scope in the time allotted. I would 
-need to think hard about the most elegant way to approach this. I explicitly
-asked Claude to completely ignore parameters to avoid extra complexity when
-I wasn't sure of the right design, no did I think it mattered in the moment.
+Each backend uses different syntax for parameters like `?` vs. `%s`. The query
+AST now solves this for literals: each `Dialect` binds every literal as a
+parameter and emits its own placeholder style. What's missing is a way for users
+to supply their own named parameters (e.g. a `ParamExpr` node bound at execute
+time), since the `execute` API takes only the `Query` AST.
+
+6. Additional Query Syntax
+
+I have left out CTEs, UNION/INTERSECT/EXCEPT, OVER, subqueries, and many other
+forms. I explicitly did not want a complete SQL AST and to massively increase
+the scope in the short amount of time allotted. These would be straightforward
+to add to the AST and visitor for dialect translations.
 
 ## Support
 

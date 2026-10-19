@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import pymysql
@@ -9,14 +10,14 @@ from api.connector.base import (
     Column,
     Connector,
     ConnectorFactory,
-    Cursor,
     Option,
-    Params,
-    Result,
     Table,
     TableNotFoundError,
     TablePath,
 )
+from api.sql import MySQLDialect
+
+Params = Sequence[Any] | Mapping[str, Any] | None
 
 _KINDS = {"BASE TABLE": "table", "VIEW": "view", "SYSTEM VIEW": "view"}
 _SYSTEM_SCHEMAS = ("mysql", "sys", "performance_schema", "information_schema")
@@ -30,6 +31,8 @@ for _name, _code in vars(FIELD_TYPE).items():
 
 class MySQLConnector(Connector):
     """MySQL backend. Tables are addressed as (database, table)."""
+
+    dialect = MySQLDialect()
 
     def __init__(self, **connect_kwargs: Any) -> None:
         self._conn = pymysql.connect(**connect_kwargs, autocommit=True)
@@ -74,12 +77,11 @@ class MySQLConnector(Connector):
         kind = rows[0][0]
         return Table(path, _KINDS.get(kind, kind.lower()), columns)
 
-    def execute(
-        self, query: str, params: Params = None, *, page_size: int = 1000
-    ) -> Result:
-        cursor = self._conn.cursor()
-        cursor.execute(query, params)
-        return Cursor(cursor, page_size, _TYPE_NAMES.get)
+    def _cursor(self) -> Any:
+        return self._conn.cursor()
+
+    def _type_name(self, type_code: Any) -> str | None:
+        return _TYPE_NAMES.get(type_code)
 
     def close(self) -> None:
         self._conn.close()

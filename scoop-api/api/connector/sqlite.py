@@ -6,15 +6,13 @@ from api.connector.base import (
     Column,
     Connector,
     ConnectorFactory,
-    Cursor,
     Option,
-    Params,
-    Result,
     Table,
     TableNotFoundError,
     TablePath,
 )
 from api.db import connect
+from api.sql import SqliteDialect
 
 
 def _quote(identifier: str) -> str:
@@ -23,6 +21,8 @@ def _quote(identifier: str) -> str:
 
 class SqliteConnector(Connector):
     """SQLite backend. Tables are addressed as (schema, table); schema is main, temp or an attached db."""
+
+    dialect = SqliteDialect()
 
     def __init__(self, path: str) -> None:
         self._conn = connect(path)
@@ -68,13 +68,9 @@ class SqliteConnector(Connector):
         ]
         return Table(path, row[0], columns)
 
-    def execute(
-        self, query: str, params: Params = None, *, page_size: int = 1000
-    ) -> Result:
-        cursor = self._conn.cursor()
-        cursor.execute(query, params if params is not None else ())
-        # sqlite3 only reports declared types for table columns, not query results.
-        return Cursor(cursor, page_size, lambda _: None)
+    # No _type_name: sqlite3 only reports declared types for table columns, not query results.
+    def _cursor(self) -> Any:
+        return self._conn.cursor()
 
     def close(self) -> None:
         self._conn.close()

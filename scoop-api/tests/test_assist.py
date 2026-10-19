@@ -1,16 +1,24 @@
 import json
+import os
 import sqlite3
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
-from api.assist.agent import QueryAgent, QueryToolkit, get_query_agent, step_label
-from api.assist.readonly import NotReadOnlyError, check_read_only, run_read_only
+from api.assist.agent import (
+    QUERY_INPUT_SCHEMA,
+    QueryAgent,
+    QueryToolkit,
+    get_query_agent,
+    step_label,
+)
+from api.assist.sample import run_sample
 from api.config import Settings, get_settings
 from api.connector import SqliteConnector
 from api.main import app
-from models import AssistDoneEvent, AssistSqlEvent, AssistStatusEvent
+from api.sql import MySQLDialect
+from models import AssistDoneEvent, AssistQueryEvent, AssistStatusEvent, Query
 
 
 @pytest.fixture
@@ -33,74 +41,134 @@ def connector(db_path):
         yield c
 
 
-# ============================================================================
-# Read-only guard
-# ============================================================================
+def col(*path):
+    return {"kind": "column", "path": list(path)}
 
 
-@pytest.mark.parametrize(
-    ("sql", "dialect"),
-    [
-        ("SELECT 1", "duckdb"),
-        ("WITH a AS (SELECT 1) SELECT * FROM a", "postgres"),
-        ("SELECT 1 UNION SELECT 2", "mysql"),
-        ("DESCRIBE t", "duckdb"),
-        ("SHOW TABLES", "mysql"),
-        ("SELECT * FROM t -- trailing comment", "sqlite"),
+def zones_query(**extra):
+    return {
+        "distinct": True,
+        "select": [{"expr": col("zone")}],
+        "from": {"kind": "table", "path": ["main", "trips"]},
+        "order_by": [{"expr": col("zone")}],
+        **extra,
+    }
+
+
+FARE_BY_ZONE = {
+    "select": [
+        {"expr": col("zone")},
+        {
+            "expr": {"kind": "call", "name": "sum", "args": [col("fare")]},
+            "alias": "total",
+        },
     ],
-)
-def test_read_only_allows(sql, dialect):
-    check_read_only(sql, dialect)
+    "from": {"kind": "table", "path": ["main", "trips"]},
+    "group_by": [col("zone")],
+    "order_by": [{"expr": col("total"), "direction": "desc"}],
+}
 
 
-@pytest.mark.parametrize(
-    ("sql", "dialect"),
-    [
-        ("DELETE FROM t", "sqlite"),
-        ("DROP TABLE t", "duckdb"),
-        ("INSERT INTO t SELECT 1", "mysql"),
-        ("CREATE TABLE x AS SELECT 1", "duckdb"),
-        ("SELECT 1; SELECT 2", "duckdb"),
-        ("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", "postgres"),
-        ("SELECT * INTO copy FROM t", "postgres"),
-        ("COPY t TO 'x.csv'", "duckdb"),
-        ("ATTACH 'x.db'", "duckdb"),
-        ("PRAGMA writable_schema = 1", "sqlite"),
-        ("SET x = 1", "mysql"),
-        ("SELEC oops", "sqlite"),
-    ],
-)
-def test_read_only_refuses(sql, dialect):
-    with pytest.raises(NotReadOnlyError):
-        check_read_only(sql, dialect)
+# ============================================================================
+# Sampling
+# ============================================================================
 
 
-def test_run_read_only_caps_rows(connector):
-    sample = run_read_only(connector, "sqlite", "SELECT * FROM trips;", max_rows=20)
+def test_run_sample_caps_rows(connector):
+    query = Query.model_validate(
+        {
+            "select": [{"expr": {"kind": "star"}}],
+            "from": {"kind": "table", "path": ["trips"]},
+        }
+    )
+    sample = run_sample(connector, query, max_rows=20)
     assert [c.name for c in sample.columns] == ["id", "zone", "fare"]
     assert len(sample.rows) == 20
     assert sample.rows[0] == [0, "zone0", 0.0]
     assert sample.truncated
 
 
-def test_run_read_only_keeps_smaller_limit(connector):
-    sample = run_read_only(
-        connector, "sqlite", "SELECT id FROM trips LIMIT 5", max_rows=20
+def test_run_sample_keeps_smaller_limit(connector):
+    query = Query.model_validate(
+        {
+            "select": [{"expr": col("id")}],
+            "from": {"kind": "table", "path": ["trips"]},
+            "limit": 5,
+        }
     )
+    sample = run_sample(connector, query, max_rows=20)
     assert sample.rows == [[i] for i in range(5)]
     assert not sample.truncated
 
 
-def test_run_read_only_clips_long_text(connector):
-    sample = run_read_only(connector, "sqlite", "SELECT printf('%.500c', 'x') AS s")
+def test_run_sample_clips_long_text(connector):
+    printf = {
+        "kind": "call",
+        "name": "printf",
+        "args": [
+            {"kind": "literal", "value": "%.500c"},
+            {"kind": "literal", "value": "x"},
+        ],
+    }
+    query = Query.model_validate({"select": [{"expr": printf, "alias": "s"}]})
+    sample = run_sample(connector, query)
     assert sample.rows[0][0] == "x" * 200 + "…"
 
 
-def test_run_read_only_refuses_writes(connector):
-    with pytest.raises(NotReadOnlyError):
-        run_read_only(connector, "sqlite", "DELETE FROM trips")
-    sample = run_read_only(connector, "sqlite", "SELECT count(*) AS n FROM trips")
-    assert sample.rows == [[50]]
+# ============================================================================
+# Query validation
+# ============================================================================
+
+
+def test_parse_query_accepts_ast(connector):
+    parsed = QueryToolkit(connector, "sqlite").parse_query(FARE_BY_ZONE)
+    assert isinstance(parsed, Query)
+    assert parsed.group_by[0].path == ["zone"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            {"from": {"kind": "table", "path": ["trips"]}},
+            "query.select: Field required",
+        ),
+        ({"select": [{"expr": {"kind": "col", "path": ["x"]}}]}, "query.select.0.expr"),
+        (
+            {"select": [{"expr": col("zone")}], "wher": col("x")},
+            "query.wher: unknown field",
+        ),
+        (
+            {"select": [{"expr": {**col("zone"), "alias": "z"}}]},
+            "query.select[0].expr.alias: unknown field",
+        ),
+        (
+            {"select": [{"expr": {"kind": "call", "name": "f;x", "args": []}}]},
+            "function name",
+        ),
+    ],
+)
+def test_parse_query_reports_errors(connector, raw, expected):
+    error = QueryToolkit(connector, "sqlite").parse_query(raw)
+    assert isinstance(error, str)
+    assert expected in error
+
+
+def test_parse_query_reports_unsupported_syntax(connector):
+    connector.dialect = MySQLDialect()  # instance attribute shadows the class's
+    full_join = {
+        "select": [{"expr": {"kind": "star"}}],
+        "from": {
+            "kind": "join",
+            "join_type": "full",
+            "left": {"kind": "table", "path": ["a"]},
+            "right": {"kind": "table", "path": ["b"]},
+            "on": {"kind": "literal", "value": True},
+        },
+    }
+    assert QueryToolkit(connector, "mysql").parse_query(full_join) == (
+        "MySQL does not support FULL JOIN"
+    )
 
 
 # ============================================================================
@@ -117,26 +185,27 @@ def test_toolkit_list_and_describe(connector):
     assert toolkit.describe_table(["main", "nope"]).startswith("Error: no table")
 
 
-def test_toolkit_run_sql(connector):
+def test_toolkit_run_query(connector):
     toolkit = QueryToolkit(connector, "sqlite")
-    result = json.loads(
-        toolkit.run_sql("SELECT DISTINCT zone FROM trips ORDER BY zone")
-    )
-    assert result == {
+    assert json.loads(toolkit.run_query(zones_query())) == {
         "columns": ["zone"],
         "rows": [["zone0"], ["zone1"], ["zone2"]],
         "truncated": False,
     }
-    assert toolkit.run_sql("DROP TABLE trips").startswith("Refused:")
-    assert toolkit.run_sql("SELECT nope FROM trips").startswith("Error:")
+    assert toolkit.run_query({"select": []}).startswith("Error:")
+    # Qualified: SQLite reads an unknown bare "nope" as a string literal
+    bad_column = zones_query(select=[{"expr": col("trips", "nope")}], order_by=None)
+    assert toolkit.run_query(bad_column).startswith("Error:")
 
 
 def test_toolkit_submit_query(connector):
     toolkit = QueryToolkit(connector, "sqlite")
-    assert toolkit.submit_query("SELECT 1; SELECT 2").startswith("Not accepted")
-    assert toolkit.final_sql is None
-    assert toolkit.submit_query("  SELECT zone FROM trips\n") == "Accepted."
-    assert toolkit.final_sql == "SELECT zone FROM trips"
+    assert toolkit.submit_query({"selec": []}).startswith("Not accepted")
+    unknown_column = zones_query(select=[{"expr": col("trips", "nope")}], order_by=None)
+    assert "no such column" in toolkit.submit_query(unknown_column)
+    assert toolkit.final_query is None
+    assert toolkit.submit_query(FARE_BY_ZONE) == "Accepted."
+    assert toolkit.final_query == Query.model_validate(FARE_BY_ZONE)
 
 
 def test_step_label():
@@ -144,6 +213,55 @@ def test_step_label():
     assert step_label("describe_table", {"path": ["main", "trips"]}) == (
         "Reading main.trips…"
     )
+    assert step_label("run_query", {"query": {}}) == "Sampling data…"
+
+
+# ============================================================================
+# Tool schemas
+# ============================================================================
+
+
+def _refs(node):
+    if isinstance(node, dict):
+        if "$ref" in node:
+            yield node["$ref"]
+        for value in node.values():
+            yield from _refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _refs(item)
+
+
+def test_tool_definitions(connector):
+    tools = {t.name: t.to_dict() for t in QueryToolkit(connector, "sqlite").tools()}
+    assert tools["list_tables"]["strict"] is True
+    assert tools["describe_table"]["strict"] is True
+    for name in ("run_query", "submit_query"):
+        # Recursive schemas can't be strict
+        assert "strict" not in tools[name]
+        assert tools[name]["input_schema"] == QUERY_INPUT_SCHEMA
+
+
+def test_query_input_schema():
+    schema = QUERY_INPUT_SCHEMA
+    assert schema["required"] == ["query"]
+    defs = schema["$defs"]
+    assert {"Query", "Expr", "FromItem"} <= defs.keys()
+    for ref in _refs(schema):
+        assert ref.removeprefix("#/$defs/") in defs
+    for name, d in defs.items():
+        assert "discriminator" not in d
+        if d.get("type") == "object":
+            assert d["additionalProperties"] is False, name
+    assert defs["ColumnExpr"]["required"] == ["kind", "path"]
+    assert defs["Query"]["required"] == ["select"]
+
+
+def test_query_round_trips_by_alias():
+    query = Query.model_validate(FARE_BY_ZONE)
+    dumped = query.model_dump(by_alias=True, exclude_none=True)
+    assert "from" in dumped and "from_" not in dumped
+    assert Query.model_validate(dumped) == query
 
 
 # ============================================================================
@@ -166,6 +284,7 @@ class FakeRunner:
         self.turns = turns
         self.tools = {t.name: t for t in tools}
         self.calls = 0
+        self.results = []
 
     def __iter__(self):
         for message in self.turns:
@@ -180,6 +299,7 @@ class FakeRunner:
                 for b in self.last.content
                 if b.type == "tool_use"
             ]
+            self.results.extend(self.cached)
         return self.cached
 
 
@@ -201,8 +321,8 @@ def test_agent_streams_steps_then_sql(connector):
     client = FakeClient(
         [
             _message(_tool_use("describe_table", path=["main", "trips"])),
-            _message(_tool_use("submit_query", sql="SELECT 1; SELECT 2")),
-            _message(_tool_use("submit_query", sql="SELECT zone FROM trips")),
+            _message(_tool_use("submit_query", query={"from": FARE_BY_ZONE["from"]})),
+            _message(_tool_use("submit_query", query=FARE_BY_ZONE)),
             _message(stop_reason="end_turn"),  # never reached
         ]
     )
@@ -212,10 +332,13 @@ def test_agent_streams_steps_then_sql(connector):
         AssistStatusEvent(type="status", message="Reading main.trips…"),
         AssistStatusEvent(type="status", message="Checking the query…"),
         AssistStatusEvent(type="status", message="Checking the query…"),
-        AssistSqlEvent(type="sql", sql="SELECT zone FROM trips"),
+        AssistQueryEvent(type="query", query=Query.model_validate(FARE_BY_ZONE)),
         AssistDoneEvent(type="done"),
     ]
     assert client.runner.calls == 3
+    _, rejected, accepted = client.runner.results
+    assert rejected.startswith("Not accepted:\nquery.select: Field required")
+    assert accepted == "Accepted."
 
     request = client.requests[0]
     assert request["model"] == "claude-sonnet-5-5"
@@ -275,7 +398,15 @@ def test_generate_streams_sse(api, db_path):
         def generate(self, connector, dialect, prompt, context):
             seen.update(dialect=dialect, prompt=prompt, context=context)
             yield AssistStatusEvent(type="status", message="Listing tables…")
-            yield AssistSqlEvent(type="sql", sql="SELECT 1")
+            yield AssistQueryEvent(
+                type="query",
+                query=Query.model_validate(
+                    {
+                        "select": [{"expr": {"kind": "star"}}],
+                        "from": {"kind": "table", "path": ["trips"]},
+                    }
+                ),
+            )
             yield AssistDoneEvent(type="done")
 
     app.dependency_overrides[get_query_agent] = FakeAgent
@@ -288,7 +419,10 @@ def test_generate_streams_sse(api, db_path):
     assert seen == {"dialect": "sqlite", "prompt": "one", "context": "-- one"}
     assert r.text == (
         'event: status\ndata: {"type":"status","message":"Listing tables…"}\n\n'
-        'event: sql\ndata: {"type":"sql","sql":"SELECT 1"}\n\n'
+        'event: query\ndata: {"type":"query","query":{"distinct":false,'
+        '"select":[{"expr":{"kind":"star","qualifier":null},"alias":null}],'
+        '"from":{"kind":"table","path":["trips"],"alias":null},"where":null,'
+        '"group_by":null,"having":null,"order_by":null,"limit":null,"offset":null}}\n\n'
         'event: done\ndata: {"type":"done"}\n\n'
     )
 
@@ -300,3 +434,28 @@ def test_generate_unknown_connector_is_404(api):
         json={"prompt": "x"},
     )
     assert r.status_code == 404
+
+
+# ============================================================================
+# Live (Claude API)
+# ============================================================================
+
+
+@pytest.mark.live
+@pytest.mark.skipif(
+    not os.environ.get("ANTHROPIC_API_KEY"), reason="ANTHROPIC_API_KEY is not set"
+)
+def test_agent_live(connector):
+    import anthropic
+
+    agent = QueryAgent(anthropic.Anthropic(), Settings().assist_model)
+    prompt = "total fare per zone, highest first"
+    events = list(agent.generate(connector, "sqlite", prompt, prompt))
+    assert events[-1] == AssistDoneEvent(type="done"), events
+    query = next(e.query for e in events if e.type == "query")
+    with connector.execute(query) as result:
+        names = [c.name for c in result.columns]
+        rows = [row for page in result for row in zip(*page.data.values())]
+    assert len(rows) == 3
+    fares = [row[names.index(n)] for row in rows for n in names if n != "zone"]
+    assert fares == sorted(fares, reverse=True)

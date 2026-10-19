@@ -8,20 +8,20 @@ from api.connector.base import (
     Column,
     Connector,
     ConnectorFactory,
-    Cursor,
     Option,
-    Params,
-    Result,
     Table,
     TableNotFoundError,
     TablePath,
 )
+from api.sql import DuckDBDialect
 
 _KINDS = {"BASE TABLE": "table", "VIEW": "view", "LOCAL TEMPORARY": "table"}
 
 
 class DuckDBConnector(Connector):
     """DuckDB backend. Tables are addressed as (catalog, schema, table)."""
+
+    dialect = DuckDBDialect()
 
     def __init__(self, database: str = ":memory:") -> None:
         self._conn = duckdb.connect(database)
@@ -63,12 +63,11 @@ class DuckDBConnector(Connector):
         ]
         return Table(path, _KINDS.get(row[0], row[0].lower()), columns)
 
-    def execute(
-        self, query: str, params: Params = None, *, page_size: int = 1000
-    ) -> Result:
-        cursor = self._conn.cursor()
-        cursor.execute(query, params)
-        return Cursor(cursor, page_size, str)
+    def _cursor(self) -> Any:
+        return self._conn.cursor()
+
+    def _type_name(self, type_code: Any) -> str | None:
+        return str(type_code)
 
     def close(self) -> None:
         self._conn.close()

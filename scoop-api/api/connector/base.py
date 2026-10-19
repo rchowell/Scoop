@@ -5,12 +5,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Self
+from typing import Any, ClassVar, Self
+
+from api.sql import Dialect
+from models import Query
 
 # Hierarchical table identifier, e.g. ("main", "users") or ("memory", "main", "users").
 TablePath = tuple[str, ...]
-
-Params = Sequence[Any] | Mapping[str, Any] | None
 
 
 class ConnectorError(Exception):
@@ -72,6 +73,8 @@ class Result(ABC, Iterator[Page]):
 
 
 class Connector(ABC):
+    dialect: ClassVar[Dialect]
+
     @abstractmethod
     def list_tables(self, namespace: TablePath = ()) -> list[TablePath]:
         """List tables and views whose path starts with `namespace`."""
@@ -80,11 +83,22 @@ class Connector(ABC):
     def get_table(self, path: TablePath) -> Table:
         """Describe a table or view; raises TableNotFoundError if it doesn't exist."""
 
+    def execute(self, query: Query, *, page_size: int = 1000) -> Result:
+        """Run `query`, returning pages of at most `page_size` rows."""
+        if page_size < 1:
+            raise ValueError("page_size must be >= 1")
+        sql, params = self.dialect.compile(query)
+        cursor = self._cursor()
+        cursor.execute(sql, params)
+        return Cursor(cursor, page_size, self._type_name)
+
     @abstractmethod
-    def execute(
-        self, query: str, params: Params = None, *, page_size: int = 1000
-    ) -> Result:
-        """Run `query` with DB-API style `params`, returning pages of at most `page_size` rows."""
+    def _cursor(self) -> Any:
+        """A fresh DB-API 2.0 cursor."""
+
+    def _type_name(self, type_code: Any) -> str | None:
+        """Backend-native type name for a cursor description's type_code."""
+        return None
 
     @abstractmethod
     def close(self) -> None: ...
@@ -188,9 +202,6 @@ class Cursor(Result):
     def __init__(
         self, cursor: Any, page_size: int, type_name: Callable[[Any], str | None]
     ) -> None:
-        if page_size < 1:
-            cursor.close()
-            raise ValueError("page_size must be >= 1")
         self._cursor = cursor
         self._page_size = page_size
         self._closed = False

@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 import pytest
 
 from api.connector import TableNotFoundError, create_connector
+from models import Query
+from tests.test_ast import binary, col, lit
+from tests.test_sql import table
 
 SEED = [
     "CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR)",
@@ -18,20 +21,16 @@ class Backend:
     prefix: tuple[str, ...]
     types: tuple[str, str]  # expected native types of users.id, users.name
     seed: list[str] = field(default_factory=lambda: SEED)
-    placeholder: str = "?"
 
 
 BACKENDS = {
     "sqlite": Backend(("main",), ("INTEGER", "VARCHAR")),
     "duckdb": Backend(("memory", "main"), ("INTEGER", "VARCHAR")),
-    "postgres": Backend(
-        ("public",), ("integer", "character varying"), placeholder="%s"
-    ),
+    "postgres": Backend(("public",), ("integer", "character varying")),
     "mysql": Backend(
         ("test",),
         ("int", "varchar"),
         seed=[SEED[0].replace("VARCHAR", "VARCHAR(255)"), *SEED[1:]],
-        placeholder="%s",
     ),
 }
 
@@ -51,8 +50,11 @@ def conn(request, backend, tmp_path):
         case "postgres" | "mysql":
             options = request.getfixturevalue(f"{backend}_options")
     c = create_connector(backend, options)
+    # execute() only takes queries, so seed through the driver
+    cursor = c._cursor()
     for stmt in [*RESET, *BACKENDS[backend].seed]:
-        c.execute(stmt).close()
+        cursor.execute(stmt)
+    cursor.close()
     with c:
         yield c
 
@@ -88,8 +90,20 @@ def test_get_table_missing(conn):
         conn.get_table(("a", "b", "c", "d"))
 
 
+def select(*columns, **clauses) -> Query:
+    return Query.model_validate(
+        {"select": [{"expr": c} for c in columns], "from": table("users"), **clauses}
+    )
+
+
+BY_ID = [{"expr": col("id")}]
+ORDERED_IDS = select(col("id"), order_by=BY_ID)
+ORDERED_NAMES = select(col("name"), order_by=BY_ID)
+
+
 def test_execute_pages(conn):
-    with conn.execute("SELECT id, name FROM users ORDER BY id", page_size=2) as result:
+    query = select(col("id"), col("name"), order_by=BY_ID)
+    with conn.execute(query, page_size=2) as result:
         assert [c.name for c in result.columns] == ["id", "name"]
         pages = list(result)
     assert [len(p) for p in pages] == [2, 2, 1]
@@ -100,26 +114,48 @@ def test_execute_pages(conn):
 
 
 def test_execute_empty(conn):
-    with conn.execute("SELECT id, name FROM users WHERE id < 0") as result:
+    query = select(col("id"), col("name"), where=binary("lt", col("id"), lit(0)))
+    with conn.execute(query) as result:
         assert [c.name for c in result.columns] == ["id", "name"]
         assert list(result) == []
 
 
-def test_execute_params(conn, spec):
-    query = f"SELECT name FROM users WHERE id = {spec.placeholder}"
-    with conn.execute(query, [3]) as result:
+def test_execute_literals_are_bound(conn):
+    query = select(col("name"), where=binary("eq", col("id"), lit(3)))
+    with conn.execute(query) as result:
         assert [p.data for p in result] == [{"name": ["c"]}]
 
 
+def test_execute_dialect_syntax(conn):
+    # MOD needs %% escaping on pyformat drivers; OFFSET without LIMIT and
+    # NULLS FIRST need rewriting on SQLite and MySQL.
+    query = select(
+        binary("mod", col("id"), lit(2)),
+        where=binary("gt", col("id"), lit(1)),
+        order_by=BY_ID,
+        offset=2,
+    )
+    with conn.execute(query) as result:
+        assert [p.data[result.columns[0].name] for p in result] == [[0, 1]]
+    query = select(
+        col("name"), order_by=[{"expr": col("name"), "nulls": "first"}], limit=2
+    )
+    with conn.execute(query) as result:
+        assert [p.data for p in result] == [{"name": [None, "a"]}]
+
+
 def test_execute_duplicate_columns(conn):
-    with conn.execute("SELECT id, id, id FROM users WHERE id = 1") as result:
+    query = select(
+        col("id"), col("id"), col("id"), where=binary("eq", col("id"), lit(1))
+    )
+    with conn.execute(query) as result:
         assert [p.data for p in result] == [{"id": [1], "id_1": [1], "id_2": [1]}]
 
 
 def test_concurrent_results(conn):
     with (
-        conn.execute("SELECT id FROM users ORDER BY id", page_size=1) as a,
-        conn.execute("SELECT name FROM users ORDER BY id", page_size=1) as b,
+        conn.execute(ORDERED_IDS, page_size=1) as a,
+        conn.execute(ORDERED_NAMES, page_size=1) as b,
     ):
         assert next(a).data == {"id": [1]}
         assert next(b).data == {"name": ["a"]}
@@ -127,7 +163,7 @@ def test_concurrent_results(conn):
 
 
 def test_close_stops_iteration(conn):
-    result = conn.execute("SELECT id FROM users", page_size=1)
+    result = conn.execute(ORDERED_IDS, page_size=1)
     next(result)
     result.close()
     assert list(result) == []
@@ -135,4 +171,4 @@ def test_close_stops_iteration(conn):
 
 def test_invalid_page_size(conn):
     with pytest.raises(ValueError):
-        conn.execute("SELECT 1", page_size=0)
+        conn.execute(ORDERED_IDS, page_size=0)

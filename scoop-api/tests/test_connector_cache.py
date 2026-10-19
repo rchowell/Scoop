@@ -7,6 +7,10 @@ import pytest
 from api.connector import ConnectorError
 from api.connector_cache import ConnectorCache
 from api.db import SCHEMA, connect
+from tests.test_ast import lit
+from tests.test_sql import select
+
+SELECT_1 = select(lit(1))
 
 
 @pytest.fixture
@@ -35,7 +39,7 @@ def _insert(db, kind="sqlite", options=None) -> uuid.UUID:
 
 def _closed(connector) -> bool:
     try:
-        connector.execute("SELECT 1").close()
+        connector.execute(SELECT_1).close()
     except sqlite3.ProgrammingError:
         return True
     return False

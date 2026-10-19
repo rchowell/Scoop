@@ -9,7 +9,8 @@ from api.connector import (
     create_connector,
     get_factory,
 )
-from models import ConnectorKind
+from models import ConnectorKind, Query
+from tests.test_ast import lit
 
 
 def test_registry():
@@ -48,7 +49,8 @@ def test_create(kind, options, cls, tmp_path):
         options = {"path": str(tmp_path / options["path"])}
     with create_connector(kind, options) as conn:
         assert isinstance(conn, cls)
-        with conn.execute("SELECT 1 AS x") as result:
+        query = Query.model_validate({"select": [{"expr": lit(1), "alias": "x"}]})
+        with conn.execute(query) as result:
             assert [p.data for p in result] == [{"x": [1]}]
 
 

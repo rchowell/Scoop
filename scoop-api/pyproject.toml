@@ -11,7 +11,6 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pydantic",
     "pymysql>=1.1",
-    "sqlglot>=30.21.0",
 ]
 
 [dependency-groups]
@@ -32,8 +31,17 @@ snake-case-field = true
 field-constraints = true
 capitalize-enum-members = true
 allow-extra-fields = true
+# Plain unions, not RootModel wrappers: children are the node classes themselves
+use-type-alias = true
+# Single-value enums (discriminator tags) become Literal, defaulted so nodes
+# can be built without passing `kind`
+enum-field-as-literal = "one"
+use-one-literal-as-default = true
+# Construct with Python names for keyword fields, e.g. CaseExpr(else_=...)
+allow-population-by-field-name = true
 
 [tool.pytest.ini_options]
 markers = [
     "integration: end-to-end HTTP tests against every connector backend (starts Docker containers)",
+    "live: calls the Claude API (needs ANTHROPIC_API_KEY)",
 ]

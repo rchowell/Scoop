@@ -1,3 +1,4 @@
+import sqlite3
 import uuid
 
 import pytest
@@ -171,8 +172,9 @@ def test_connector_is_cached(client, tmp_path):
 
 def test_update_evicts_cached_connector(client, tmp_path):
     body = {"name": "db", "kind": "sqlite", "options": {"path": str(tmp_path / "x.db")}}
+    with sqlite3.connect(tmp_path / "x.db") as db:
+        db.execute("CREATE TABLE a (v INTEGER)")
     url = f"/v1/connectors/{client.post('/v1/connectors', json=body).json()['id']}"
-    client.post(f"{url}/execute", json={"query": "CREATE TABLE a (v INTEGER)"})
     assert client.get(f"{url}/tables").json()["tables"] == [["main", "a"]]
 
     new_options = {"path": str(tmp_path / "y.db")}

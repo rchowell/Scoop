@@ -1,6 +1,7 @@
 import "@typespec/http";
 import "@typespec/openapi";
 import "@typespec/rest";
+import "./ast.tsp";
 
 using TypeSpec.Http;
 using TypeSpec.Rest;
@@ -109,7 +110,7 @@ op ExecuteConnectorQuery(
 @doc("""
   Have an agent author a query for `prompt`, streaming progress as server-sent
   events. Each event's name is an AssistEvent `type` and its data is the JSON
-  event: zero or more `status`, then `sql` and `done`, or `error`.
+  event: zero or more `status`, then `query` and `done`, or `error`.
   """)
 op GenerateConnectorQuery(
   @path id: UUID,
@@ -298,12 +299,18 @@ model Column {
   nullable?: boolean | null;
 }
 
+@doc("Whether a relation is a base table or a view")
+enum TableKind {
+  Table: "table",
+  View: "view",
+}
+
 model Table {
   @doc("Hierarchical table identifier, e.g. [\"main\", \"users\"]")
   path: string[];
 
   @doc("Whether this is a table or a view")
-  kind: "table" | "view";
+  kind: TableKind;
 
   columns: Column[];
 }
@@ -314,11 +321,8 @@ model TableList {
 }
 
 model ExecuteRequest {
-  @doc("SQL to run")
-  query: string;
-
-  @doc("DB-API parameters: an array for positional, an object for named")
-  params?: unknown[] | Record<unknown>;
+  @doc("Query to run")
+  query: Query;
 
   @doc("Maximum rows to return")
   @minValue(1)
@@ -352,9 +356,9 @@ model AssistStatusEvent {
 }
 
 @doc("The authored query")
-model AssistSqlEvent {
-  type: "sql";
-  sql: string;
+model AssistQueryEvent {
+  type: "query";
+  query: Query;
 }
 
 @doc("The agent failed; no query was authored")
@@ -371,7 +375,7 @@ model AssistDoneEvent {
 @discriminated(#{ envelope: "none", discriminatorPropertyName: "type" })
 union AssistEvent {
   status: AssistStatusEvent,
-  sql: AssistSqlEvent,
+  query: AssistQueryEvent,
   error: AssistErrorEvent,
   done: AssistDoneEvent,
 }

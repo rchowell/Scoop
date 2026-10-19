@@ -9,20 +9,20 @@ from api.connector.base import (
     Column,
     Connector,
     ConnectorFactory,
-    Cursor,
     Option,
-    Params,
-    Result,
     Table,
     TableNotFoundError,
     TablePath,
 )
+from api.sql import PostgresDialect
 
 _KINDS = {"BASE TABLE": "table", "VIEW": "view", "LOCAL TEMPORARY": "table"}
 
 
 class PostgresConnector(Connector):
     """Postgres backend. Tables are addressed as (schema, table) within the connected database."""
+
+    dialect = PostgresDialect()
 
     def __init__(self, conninfo: str) -> None:
         self._conn = psycopg.connect(conninfo, autocommit=True)
@@ -62,12 +62,8 @@ class PostgresConnector(Connector):
         info = self._conn.adapters.types.get(oid)
         return info.regtype if info else None
 
-    def execute(
-        self, query: str, params: Params = None, *, page_size: int = 1000
-    ) -> Result:
-        cursor = self._conn.cursor()
-        cursor.execute(query, params)
-        return Cursor(cursor, page_size, self._type_name)
+    def _cursor(self) -> Any:
+        return self._conn.cursor()
 
     def close(self) -> None:
         self._conn.close()

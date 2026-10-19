@@ -1,8 +1,12 @@
 """An agent that authors a SQL query from a plain-language request.
 
 Claude explores the connector through a few tools (list tables, describe a
-table, run a small read-only sample) and finishes by calling `submit_query`.
+table, sample a query) and finishes by calling `submit_query` with a query AST.
 Progress is reported as AssistEvents for the client to stream.
+
+The AST is recursive, which strict structured outputs can't express, so the
+query tools carry its JSON Schema without `strict` and validate input here,
+returning the errors to Claude to fix. The other tools are strict.
 """
 
 import json
@@ -12,9 +16,9 @@ from typing import Annotated, Any
 import anthropic
 from anthropic import beta_tool
 from fastapi import Depends
-from sqlglot.errors import ParseError
+from pydantic import BaseModel, ValidationError
 
-from api.assist.readonly import NotReadOnlyError, parse_one, run_read_only
+from api.assist.sample import run_sample
 from api.config import Settings, get_settings
 from api.connector import Connector, TableNotFoundError, TablePath
 from api.problem import Problem
@@ -22,11 +26,12 @@ from api.query import CLIENT_ERRORS
 from models import (
     AssistDoneEvent,
     AssistErrorEvent,
-    AssistSqlEvent,
+    AssistQueryEvent,
     AssistStatusEvent,
+    Query,
 )
 
-AssistEvent = AssistStatusEvent | AssistSqlEvent | AssistErrorEvent | AssistDoneEvent
+AssistEvent = AssistStatusEvent | AssistQueryEvent | AssistErrorEvent | AssistDoneEvent
 
 MAX_TURNS = 15
 MAX_LISTED_TABLES = 500
@@ -35,30 +40,71 @@ MAX_SEEDED_TABLES = 200
 SAMPLE_ROWS = 20
 
 SYSTEM_PROMPT = """\
-You write SQL for a database query editor. The user describes what they want \
-in plain language; you write one query that does it.
+You write queries for a database query editor. The user describes what they \
+want in plain language; you write one query that does it.
+
+A query is a JSON syntax tree (the `query` argument of run_query and \
+submit_query), which is rendered to SQL for the database. Every expression and \
+row source has a `kind`. Table paths have one element per part, as in the \
+table list (e.g. ["main", "trips"]); column paths are [column] or \
+[table_alias, column]. Literals are bound as parameters, so write values \
+as-is with no quoting.
 
 The request comes with the SQL dialect, the database's tables (or how many \
-there are), and the editor's current text. If the editor already holds a \
-query, the request may be asking you to change it; keep what still applies.
+there are), and possibly the editor's current query as JSON. If it does, the \
+request is asking you to change that query; keep what still applies.
 
 Work like this:
-- Inspect the tables you plan to use with describe_table before writing SQL. \
-Never guess column names or types.
+- Inspect the tables you plan to use with describe_table before writing a \
+query. Never guess column names or types.
 - When the query depends on actual values (category spellings, date formats, \
-units), check them with run_sql. Keep sample queries small.
-- Write exactly one statement in the given dialect. Qualify tables the way \
-they appear in the table list. Prefer readable SQL: explicit column lists, \
-clear aliases, one clause per line.
+units), check them with run_query. Keep sample queries small.
+- Function names and cast types are passed through to the database, so use \
+ones the dialect supports.
 - Write what the user asked for. Include an ORDER BY or LIMIT only when the \
-request implies one.
-- Finish by calling submit_query with the final SQL. It replaces the request in the editor \
-and is the only output the user sees.
-- Start the submitted SQL with the request as `--` comment lines, in the \
-user's words. When refining a query that already has such a comment, keep it \
-and add the new request on its own line. Put any caveats in further comment \
-lines.
+request implies one. Give computed columns clear aliases.
+- Finish by calling submit_query with the final query. It replaces the \
+request in the editor and is the only output the user sees.
 """
+
+
+def _strict_defs(defs: dict[str, Any]) -> dict[str, Any]:
+    """Close every object in the AST's $defs and require discriminator tags."""
+    out = {}
+    for name, schema in defs.items():
+        # `discriminator` is OpenAPI, not JSON Schema; the required `kind` const does its job.
+        schema = {
+            k: v for k, v in schema.items() if k not in ("title", "discriminator")
+        }
+        if schema.get("type") == "object":
+            schema["additionalProperties"] = False
+            tags = [k for k, p in schema["properties"].items() if "const" in p]
+            schema["required"] = [*tags, *schema.get("required", [])]
+        out[name] = schema
+    return out
+
+
+QUERY_INPUT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"query": {"$ref": "#/$defs/Query"}},
+    "required": ["query"],
+    "additionalProperties": False,
+    "$defs": _strict_defs(Query.model_json_schema(by_alias=True)["$defs"]),
+}
+
+
+def _unknown_fields(node: Any, loc: str = "query") -> Iterator[str]:
+    # The generated models allow extra fields, which would silently drop a typo.
+    if isinstance(node, BaseModel):
+        for key in node.model_extra or {}:
+            yield f"{loc}.{key}: unknown field"
+        for name, field in type(node).model_fields.items():
+            yield from _unknown_fields(
+                getattr(node, name), f"{loc}.{field.alias or name}"
+            )
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            yield from _unknown_fields(item, f"{loc}[{i}]")
 
 
 def _path(path: TablePath) -> str:
@@ -71,7 +117,24 @@ class QueryToolkit:
     def __init__(self, connector: Connector, dialect: str) -> None:
         self.connector = connector
         self.dialect = dialect
-        self.final_sql: str | None = None
+        self.final_query: Query | None = None
+
+    def parse_query(self, raw: Any) -> Query | str:
+        """The validated query, or a description of what's wrong with it."""
+        try:
+            query = Query.model_validate(raw)
+        except ValidationError as e:
+            return "\n".join(
+                f"{'.'.join(map(str, ('query', *err['loc'])))}: {err['msg']}"
+                for err in e.errors(include_url=False)
+            )
+        if unknown := list(_unknown_fields(query)):
+            return "\n".join(unknown)
+        try:
+            self.connector.dialect.compile(query)
+        except ValueError as e:
+            return str(e)
+        return query
 
     def list_tables(self, namespace: list[str] | None = None) -> str:
         try:
@@ -103,11 +166,12 @@ class QueryToolkit:
             }
         )
 
-    def run_sql(self, sql: str) -> str:
+    def run_query(self, query: Any) -> str:
+        parsed = self.parse_query(query)
+        if isinstance(parsed, str):
+            return f"Error: invalid query:\n{parsed}"
         try:
-            sample = run_read_only(self.connector, self.dialect, sql, SAMPLE_ROWS)
-        except NotReadOnlyError as e:
-            return f"Refused: {e}. run_sql only runs read-only queries."
+            sample = run_sample(self.connector, parsed, SAMPLE_ROWS)
         except CLIENT_ERRORS as e:
             return f"Error: {e}"
         return json.dumps(
@@ -119,16 +183,23 @@ class QueryToolkit:
             default=str,
         )
 
-    def submit_query(self, sql: str) -> str:
+    def submit_query(self, query: Any) -> str:
+        parsed = self.parse_query(query)
+        if isinstance(parsed, str):
+            return (
+                f"Not accepted:\n{parsed}\nFix the query and call submit_query again."
+            )
         try:
-            parse_one(sql, self.dialect)
-        except (NotReadOnlyError, ParseError) as e:
-            return f"Not accepted: {e}. Fix the SQL and call submit_query again."
-        self.final_sql = sql.strip()
+            # Run it for no rows so unknown tables and columns are caught here.
+            with self.connector.execute(parsed.model_copy(update={"limit": 0})):
+                pass
+        except CLIENT_ERRORS as e:
+            return f"Not accepted: {e}. Fix the query and call submit_query again."
+        self.final_query = parsed
         return "Accepted."
 
     def tools(self) -> list[Any]:
-        @beta_tool
+        @beta_tool(strict=True)
         def list_tables(namespace: list[str] | None = None) -> str:
             """List tables and views, one dotted path per line.
 
@@ -137,7 +208,7 @@ class QueryToolkit:
             """
             return self.list_tables(namespace)
 
-        @beta_tool
+        @beta_tool(strict=True)
         def describe_table(path: list[str]) -> str:
             """Get a table's kind and its columns' names, types and nullability.
 
@@ -146,27 +217,20 @@ class QueryToolkit:
             """
             return self.describe_table(path)
 
-        @beta_tool
-        def run_sql(sql: str) -> str:
-            """Run a read-only query (SELECT, DESCRIBE or SHOW) and get at most 20 rows back.
+        @beta_tool(input_schema=QUERY_INPUT_SCHEMA)
+        def run_query(query: dict[str, Any]) -> str:
+            """Run a query and get at most 20 rows back.
 
             Use it to look at real values; long text values are clipped.
-
-            Args:
-                sql: One read-only statement in the database's dialect.
             """
-            return self.run_sql(sql)
+            return self.run_query(query)
 
-        @beta_tool
-        def submit_query(sql: str) -> str:
-            """Submit the finished query; it replaces the user's request in the editor.
+        @beta_tool(input_schema=QUERY_INPUT_SCHEMA)
+        def submit_query(query: dict[str, Any]) -> str:
+            """Submit the finished query; it replaces the user's request in the editor."""
+            return self.submit_query(query)
 
-            Args:
-                sql: The final SQL, one statement in the database's dialect.
-            """
-            return self.submit_query(sql)
-
-        return [list_tables, describe_table, run_sql, submit_query]
+        return [list_tables, describe_table, run_query, submit_query]
 
 
 def step_label(name: str, input: dict[str, Any]) -> str:
@@ -181,7 +245,7 @@ def step_label(name: str, input: dict[str, Any]) -> str:
             )
         case "describe_table":
             return f"Reading {'.'.join(input.get('path') or [])}…"
-        case "run_sql":
+        case "run_query":
             return "Sampling data…"
         case "submit_query":
             return "Checking the query…"
@@ -204,6 +268,7 @@ def _first_message(toolkit: QueryToolkit, prompt: str, context: str | None) -> s
         f"<tables>\n{tables}\n</tables>",
     ]
     if context and context.strip() != prompt.strip():
+        # The editor's query AST as JSON, minus the request.
         parts.append(f"<editor>\n{context}\n</editor>")
     parts.append(f"<request>\n{prompt}\n</request>")
     return "\n\n".join(parts)
@@ -274,8 +339,8 @@ class QueryAgent:
             # Run this turn's tools now (the runner reuses the result) so we can
             # stop as soon as a query is accepted, without another model turn.
             runner.generate_tool_call_response()
-            if toolkit.final_sql is not None:
-                yield AssistSqlEvent(type="sql", sql=toolkit.final_sql)
+            if toolkit.final_query is not None:
+                yield AssistQueryEvent(type="query", query=toolkit.final_query)
                 yield AssistDoneEvent(type="done")
                 return
         yield AssistErrorEvent(

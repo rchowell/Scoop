@@ -2,7 +2,8 @@
 
 This package defines all types used in API model generation. `scoop.tsp` is
 compiled to OpenAPI 3.1 (`build/@typespec/openapi3/openapi.yaml`), which
-`scoop-api` turns into Pydantic models with `datamodel-codegen`.
+`scoop-api` turns into Pydantic models with `datamodel-codegen`. The query AST
+lives in `ast.tsp`, which `scoop.tsp` imports.
 
 ## Usage
 

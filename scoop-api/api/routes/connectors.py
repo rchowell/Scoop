@@ -106,7 +106,7 @@ def post_connector(db: Db, body: CreateConnector) -> ConnectorModel:
     db.execute(
         "INSERT INTO connectors (id, name, kind, options, created_at) VALUES (?, ?, ?, ?, ?)",
         (
-            str(model.id.root),
+            str(model.id),
             model.name,
             model.kind.value,
             json.dumps(model.options),
@@ -172,7 +172,7 @@ def execute(connector: OpenConnector, body: ExecuteRequest) -> ExecuteResult:
     max_rows = body.max_rows or 1000
     try:
         with connector.execute(
-            body.query, body.params, page_size=min(max_rows, MAX_PAGE_SIZE)
+            body.query, page_size=min(max_rows, MAX_PAGE_SIZE)
         ) as result:
             columns = result.columns
             data, truncated = collect(result, max_rows)
