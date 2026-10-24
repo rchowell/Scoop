@@ -24,7 +24,7 @@ dev = [
 [tool.datamodel-codegen]
 input = "../scoop-types/build/@typespec/openapi3/openapi.yaml"
 input-file-type = "openapi"
-output = "models.py"
+output = "api/models.py"
 output-model-type = "pydantic_v2.BaseModel"
 target-python-version = "3.11"
 snake-case-field = true
@@ -45,3 +45,10 @@ markers = [
     "integration: end-to-end HTTP tests against every connector backend (starts Docker containers)",
     "live: calls the Claude API (needs ANTHROPIC_API_KEY)",
 ]
+
+[tool.ruff.lint]
+# Sorted imports (I001) are required; `ruff check --fix` sorts them.
+extend-select = ["I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["api", "tests"]

@@ -2,24 +2,18 @@ import sqlite3
 import uuid
 
 import pytest
-from fastapi.testclient import TestClient
 
 from api.config import Settings, get_settings
-from api.main import app
-
-
-@pytest.fixture
-def client(tmp_path):
-    app.dependency_overrides[get_settings] = lambda: Settings(
-        db_path=str(tmp_path / "app.sqlite3")
-    )
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
+from api.db import MIGRATIONS, SCHEMA, connect, init_db
+from tests.conftest import DB_FILE
 
 
 def test_crud(client, tmp_path):
-    body = {"name": "db", "kind": "sqlite", "options": {"path": str(tmp_path / "x.db")}}
+    body = {
+        "name": "db",
+        "kind": "sqlite",
+        "options": {"database": str(tmp_path / "x.db")},
+    }
     created = client.post("/v1/connectors", json=body).json()
     assert {k: created[k] for k in body} == body
     url = f"/v1/connectors/{created['id']}"
@@ -30,7 +24,7 @@ def test_crud(client, tmp_path):
     assert [c["id"] for c in listing["items"]] == [created["id"]]
     assert listing["pagination"]["next"] is None
 
-    new_options = {"path": str(tmp_path / "y.db")}
+    new_options = {"database": str(tmp_path / "y.db")}
     patched = client.patch(url, json={"name": "renamed", "options": new_options})
     assert patched.status_code == 200
     assert patched.json()["name"] == "renamed"
@@ -70,9 +64,9 @@ def test_invalid_kind(client):
 @pytest.mark.parametrize(
     "options,problem",
     [
-        ({"path": "x", "bogus": 1}, "unknown option: bogus"),
-        ({}, "missing required option: path"),
-        ({"path": 1}, "path: expected str"),
+        ({"database": "x", "bogus": 1}, "unknown option: bogus"),
+        ({}, "missing required option: database"),
+        ({"database": 1}, "database: expected str"),
     ],
 )
 def test_invalid_options(client, options, problem):
@@ -87,15 +81,19 @@ def test_invalid_options(client, options, problem):
 
 
 def test_update_invalid_options(client, tmp_path):
-    body = {"name": "db", "kind": "sqlite", "options": {"path": str(tmp_path / "x")}}
+    body = {
+        "name": "db",
+        "kind": "sqlite",
+        "options": {"database": str(tmp_path / "x")},
+    }
     url = f"/v1/connectors/{client.post('/v1/connectors', json=body).json()['id']}"
-    resp = client.patch(url, json={"name": "db", "options": {"database": "x"}})
+    resp = client.patch(url, json={"name": "db", "options": {"bogus": "x"}})
     assert resp.status_code == 422
     assert client.get(url).json()["options"] == body["options"]
 
 
 def test_options_stored_raw(client):
-    options = {"host": "localhost", "port": "6543", "user": "u", "dbname": "d"}
+    options = {"host": "localhost", "port": "6543", "user": "u", "database": "d"}
     created = client.post(
         "/v1/connectors", json={"name": "pg", "kind": "postgres", "options": options}
     ).json()
@@ -104,7 +102,7 @@ def test_options_stored_raw(client):
 
 
 def test_unreachable_connector(client):
-    options = {"host": "127.0.0.1", "port": 1, "user": "u", "dbname": "d"}
+    options = {"host": "127.0.0.1", "port": 1, "user": "u", "database": "d"}
     id = client.post(
         "/v1/connectors", json={"name": "pg", "kind": "postgres", "options": options}
     ).json()["id"]
@@ -114,7 +112,7 @@ def test_unreachable_connector(client):
 
 
 def test_list_connector_kinds(client):
-    kinds = {k["kind"]: k for k in client.get("/v1/connections").json()["kinds"]}
+    kinds = {k["kind"]: k for k in client.get("/v1/connector-kinds").json()["kinds"]}
     assert set(kinds) == {"sqlite", "duckdb", "postgres", "mysql"}
     pg = kinds["postgres"]
     assert pg["name"] == "PostgreSQL"
@@ -123,7 +121,7 @@ def test_list_connector_kinds(client):
         "port",
         "user",
         "password",
-        "dbname",
+        "database",
     ]
     opts = {o["name"]: o for o in pg["options"]}
     assert opts["port"] == {
@@ -148,7 +146,8 @@ def test_list_connector_kinds(client):
     ],
 )
 def test_unknown_connector(client, method, suffix):
-    kwargs = {"json": {"query": "SELECT 1"}} if method == "post" else {}
+    query = {"select": [{"expr": {"kind": "literal", "value": 1}}]}
+    kwargs = {"json": {"query": query}} if method == "post" else {}
     resp = getattr(client, method)(f"/v1/connectors/{uuid.uuid4()}{suffix}", **kwargs)
     assert resp.status_code == 404
     assert resp.headers["content-type"] == "application/problem+json"
@@ -160,7 +159,11 @@ def _cached(client, id):
 
 
 def test_connector_is_cached(client, tmp_path):
-    body = {"name": "db", "kind": "sqlite", "options": {"path": str(tmp_path / "x.db")}}
+    body = {
+        "name": "db",
+        "kind": "sqlite",
+        "options": {"database": str(tmp_path / "x.db")},
+    }
     id = client.post("/v1/connectors", json=body).json()["id"]
     assert _cached(client, id) is None
     assert client.get(f"/v1/connectors/{id}/tables").status_code == 200
@@ -171,22 +174,79 @@ def test_connector_is_cached(client, tmp_path):
 
 
 def test_update_evicts_cached_connector(client, tmp_path):
-    body = {"name": "db", "kind": "sqlite", "options": {"path": str(tmp_path / "x.db")}}
+    body = {
+        "name": "db",
+        "kind": "sqlite",
+        "options": {"database": str(tmp_path / "x.db")},
+    }
     with sqlite3.connect(tmp_path / "x.db") as db:
         db.execute("CREATE TABLE a (v INTEGER)")
     url = f"/v1/connectors/{client.post('/v1/connectors', json=body).json()['id']}"
     assert client.get(f"{url}/tables").json()["tables"] == [["main", "a"]]
 
-    new_options = {"path": str(tmp_path / "y.db")}
+    new_options = {"database": str(tmp_path / "y.db")}
     client.patch(url, json={"name": "db", "options": new_options})
     assert client.get(f"{url}/tables").json()["tables"] == []
 
 
 def test_delete_evicts_cached_connector(client, tmp_path):
-    body = {"name": "db", "kind": "sqlite", "options": {"path": str(tmp_path / "x.db")}}
+    body = {
+        "name": "db",
+        "kind": "sqlite",
+        "options": {"database": str(tmp_path / "x.db")},
+    }
     id = client.post("/v1/connectors", json=body).json()["id"]
     client.get(f"/v1/connectors/{id}/tables")
     assert _cached(client, id) is not None
     assert client.delete(f"/v1/connectors/{id}").status_code == 204
     assert _cached(client, id) is None
     assert client.get(f"/v1/connectors/{id}/tables").status_code == 404
+
+
+def test_legacy_option_names_are_migrated(tmp_path):
+    conn = connect(str(tmp_path / "legacy.sqlite3"))
+    conn.executescript(SCHEMA)  # as before migrations existed
+    for id, kind, options in [
+        ("a", "sqlite", '{"path": "x.db"}'),
+        ("b", "postgres", '{"host": "h", "user": "u", "dbname": "d"}'),
+        ("c", "mysql", '{"host": "h", "user": "u", "database": "d"}'),
+    ]:
+        conn.execute(
+            "INSERT INTO connectors VALUES (?, 'c', ?, ?, '2026-01-01T00:00:00+00:00')",
+            (id, kind, options),
+        )
+    conn.commit()
+    init_db(conn)
+    rows = dict(conn.execute("SELECT id, options FROM connectors ORDER BY id"))
+    assert rows == {
+        "a": '{"database":"x.db"}',
+        "b": '{"host":"h","user":"u","database":"d"}',
+        "c": '{"host": "h", "user": "u", "database": "d"}',
+    }
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == len(MIGRATIONS)
+
+    # Applied migrations don't run again.
+    conn.execute(
+        "INSERT INTO connectors VALUES ('d', 'c', 'sqlite', '{\"path\": \"y\"}', '')"
+    )
+    conn.commit()
+    init_db(conn)
+    assert (
+        conn.execute("SELECT options FROM connectors WHERE id = 'd'").fetchone()[0]
+        == '{"path": "y"}'
+    )
+    conn.close()
+
+
+def test_in_memory_database(client):
+    app = client.app
+    app.dependency_overrides[get_settings] = lambda: Settings(db_path=":memory:")
+    resp = client.get("/v1/connectors")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"] == []
+
+
+def test_schema_recreated_if_database_file_is_replaced(client, tmp_path):
+    assert client.get("/v1/connectors").status_code == 200
+    (tmp_path / DB_FILE).unlink()
+    assert client.get("/v1/connectors").status_code == 200

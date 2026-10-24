@@ -4,21 +4,20 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 
 from api.assist.agent import (
     QUERY_INPUT_SCHEMA,
     QueryAgent,
     QueryToolkit,
     get_query_agent,
+    run_sample,
     step_label,
 )
-from api.assist.sample import run_sample
-from api.config import Settings, get_settings
-from api.connector import SqliteConnector
+from api.config import Settings
+from api.connector import MySQLDialect, SQLiteConnector
 from api.main import app
-from api.sql import MySQLDialect
-from models import AssistDoneEvent, AssistQueryEvent, AssistStatusEvent, Query
+from api.models import AssistDoneEvent, AssistQueryEvent, AssistStatusEvent, Query
+from tests.helpers import col
 
 
 @pytest.fixture
@@ -37,12 +36,8 @@ def db_path(tmp_path):
 
 @pytest.fixture
 def connector(db_path):
-    with SqliteConnector(db_path) as c:
+    with SQLiteConnector(db_path) as c:
         yield c
-
-
-def col(*path):
-    return {"kind": "column", "path": list(path)}
 
 
 def zones_query(**extra):
@@ -121,7 +116,7 @@ def test_run_sample_clips_long_text(connector):
 
 
 def test_parse_query_accepts_ast(connector):
-    parsed = QueryToolkit(connector, "sqlite").parse_query(FARE_BY_ZONE)
+    parsed = QueryToolkit(connector).parse_query(FARE_BY_ZONE)
     assert isinstance(parsed, Query)
     assert parsed.group_by[0].path == ["zone"]
 
@@ -149,13 +144,13 @@ def test_parse_query_accepts_ast(connector):
     ],
 )
 def test_parse_query_reports_errors(connector, raw, expected):
-    error = QueryToolkit(connector, "sqlite").parse_query(raw)
+    error = QueryToolkit(connector).parse_query(raw)
     assert isinstance(error, str)
     assert expected in error
 
 
 def test_parse_query_reports_unsupported_syntax(connector):
-    connector.dialect = MySQLDialect()  # instance attribute shadows the class's
+    connector.dialect = MySQLDialect  # the instance attribute shadows the classmethod
     full_join = {
         "select": [{"expr": {"kind": "star"}}],
         "from": {
@@ -166,7 +161,7 @@ def test_parse_query_reports_unsupported_syntax(connector):
             "on": {"kind": "literal", "value": True},
         },
     }
-    assert QueryToolkit(connector, "mysql").parse_query(full_join) == (
+    assert QueryToolkit(connector).parse_query(full_join) == (
         "MySQL does not support FULL JOIN"
     )
 
@@ -177,7 +172,7 @@ def test_parse_query_reports_unsupported_syntax(connector):
 
 
 def test_toolkit_list_and_describe(connector):
-    toolkit = QueryToolkit(connector, "sqlite")
+    toolkit = QueryToolkit(connector)
     assert toolkit.list_tables() == "main.trips"
     assert toolkit.list_tables(["temp"]) == "No tables."
     described = json.loads(toolkit.describe_table(["main", "trips"]))
@@ -186,7 +181,7 @@ def test_toolkit_list_and_describe(connector):
 
 
 def test_toolkit_run_query(connector):
-    toolkit = QueryToolkit(connector, "sqlite")
+    toolkit = QueryToolkit(connector)
     assert json.loads(toolkit.run_query(zones_query())) == {
         "columns": ["zone"],
         "rows": [["zone0"], ["zone1"], ["zone2"]],
@@ -199,7 +194,7 @@ def test_toolkit_run_query(connector):
 
 
 def test_toolkit_submit_query(connector):
-    toolkit = QueryToolkit(connector, "sqlite")
+    toolkit = QueryToolkit(connector)
     assert toolkit.submit_query({"selec": []}).startswith("Not accepted")
     unknown_column = zones_query(select=[{"expr": col("trips", "nope")}], order_by=None)
     assert "no such column" in toolkit.submit_query(unknown_column)
@@ -233,7 +228,7 @@ def _refs(node):
 
 
 def test_tool_definitions(connector):
-    tools = {t.name: t.to_dict() for t in QueryToolkit(connector, "sqlite").tools()}
+    tools = {t.name: t.to_dict() for t in QueryToolkit(connector).tools()}
     assert tools["list_tables"]["strict"] is True
     assert tools["describe_table"]["strict"] is True
     for name in ("run_query", "submit_query"):
@@ -327,13 +322,13 @@ def test_agent_streams_steps_then_sql(connector):
         ]
     )
     agent = QueryAgent(client, "claude-sonnet-5-5")
-    events = list(agent.generate(connector, "sqlite", "zones", "zones"))
+    events = list(agent.generate(connector, "zones", "zones"))
     assert events == [
-        AssistStatusEvent(type="status", message="Reading main.trips…"),
-        AssistStatusEvent(type="status", message="Checking the query…"),
-        AssistStatusEvent(type="status", message="Checking the query…"),
-        AssistQueryEvent(type="query", query=Query.model_validate(FARE_BY_ZONE)),
-        AssistDoneEvent(type="done"),
+        AssistStatusEvent(message="Reading main.trips…"),
+        AssistStatusEvent(message="Checking the query…"),
+        AssistStatusEvent(message="Checking the query…"),
+        AssistQueryEvent(query=Query.model_validate(FARE_BY_ZONE)),
+        AssistDoneEvent(),
     ]
     assert client.runner.calls == 3
     _, rejected, accepted = client.runner.results
@@ -351,7 +346,7 @@ def test_agent_streams_steps_then_sql(connector):
 def test_agent_includes_editor_context(connector):
     client = FakeClient([_message(stop_reason="end_turn")])
     agent = QueryAgent(client, "m")
-    events = list(agent.generate(connector, "sqlite", "add fare", "SELECT 1"))
+    events = list(agent.generate(connector, "add fare", "SELECT 1"))
     assert (
         "<editor>\nSELECT 1\n</editor>" in client.requests[0]["messages"][0]["content"]
     )
@@ -360,7 +355,7 @@ def test_agent_includes_editor_context(connector):
 
 def test_agent_reports_refusal(connector):
     client = FakeClient([_message(stop_reason="refusal")])
-    events = list(QueryAgent(client, "m").generate(connector, "sqlite", "x"))
+    events = list(QueryAgent(client, "m").generate(connector, "x"))
     assert [e.type for e in events] == ["error"]
 
 
@@ -369,37 +364,27 @@ def test_agent_reports_refusal(connector):
 # ============================================================================
 
 
-@pytest.fixture
-def api(tmp_path):
-    settings = Settings(db_path=str(tmp_path / "app.sqlite3"))
-    app.dependency_overrides[get_settings] = lambda: settings
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
+def _create(client, db_path):
+    body = {"name": "db", "kind": "sqlite", "options": {"database": db_path}}
+    return client.post("/v1/connectors", json=body).json()["id"]
 
 
-def _create(api, db_path):
-    body = {"name": "db", "kind": "sqlite", "options": {"path": db_path}}
-    return api.post("/v1/connectors", json=body).json()["id"]
-
-
-def test_generate_without_key_is_503(api, db_path):
-    id = _create(api, db_path)
-    r = api.post(f"/v1/connectors/{id}/generate", json={"prompt": "x"})
+def test_generate_without_key_is_503(client, db_path):
+    id = _create(client, db_path)
+    r = client.post(f"/v1/connectors/{id}/generate", json={"prompt": "x"})
     assert r.status_code == 503
     assert r.json()["title"] == "Assistant Unavailable"
 
 
-def test_generate_streams_sse(api, db_path):
-    id = _create(api, db_path)
+def test_generate_streams_sse(client, db_path):
+    id = _create(client, db_path)
     seen = {}
 
     class FakeAgent:
-        def generate(self, connector, dialect, prompt, context):
-            seen.update(dialect=dialect, prompt=prompt, context=context)
-            yield AssistStatusEvent(type="status", message="Listing tables…")
+        def generate(self, connector, prompt, context):
+            seen.update(kind=connector.kind(), prompt=prompt, context=context)
+            yield AssistStatusEvent(message="Listing tables…")
             yield AssistQueryEvent(
-                type="query",
                 query=Query.model_validate(
                     {
                         "select": [{"expr": {"kind": "star"}}],
@@ -407,16 +392,16 @@ def test_generate_streams_sse(api, db_path):
                     }
                 ),
             )
-            yield AssistDoneEvent(type="done")
+            yield AssistDoneEvent()
 
     app.dependency_overrides[get_query_agent] = FakeAgent
-    r = api.post(
+    r = client.post(
         f"/v1/connectors/{id}/generate",
         json={"prompt": "one", "context": "-- one"},
     )
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("text/event-stream")
-    assert seen == {"dialect": "sqlite", "prompt": "one", "context": "-- one"}
+    assert seen == {"kind": "sqlite", "prompt": "one", "context": "-- one"}
     assert r.text == (
         'event: status\ndata: {"type":"status","message":"Listing tables…"}\n\n'
         'event: query\ndata: {"type":"query","query":{"distinct":false,'
@@ -427,9 +412,9 @@ def test_generate_streams_sse(api, db_path):
     )
 
 
-def test_generate_unknown_connector_is_404(api):
+def test_generate_unknown_connector_is_404(client):
     app.dependency_overrides[get_query_agent] = lambda: None
-    r = api.post(
+    r = client.post(
         "/v1/connectors/00000000-0000-0000-0000-000000000000/generate",
         json={"prompt": "x"},
     )
@@ -450,8 +435,8 @@ def test_agent_live(connector):
 
     agent = QueryAgent(anthropic.Anthropic(), Settings().assist_model)
     prompt = "total fare per zone, highest first"
-    events = list(agent.generate(connector, "sqlite", prompt, prompt))
-    assert events[-1] == AssistDoneEvent(type="done"), events
+    events = list(agent.generate(connector, prompt, prompt))
+    assert events[-1] == AssistDoneEvent(), events
     query = next(e.query for e in events if e.type == "query")
     with connector.execute(query) as result:
         names = [c.name for c in result.columns]

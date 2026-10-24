@@ -10,4 +10,4 @@ uv run pytest
 Set `SCOOP_DB_PATH` to use a different database file. Endpoints take a
 per-request connection via the `Db` dependency (`api/db.py`). Connector routes
 get live, cached `Connector` instances via `ConnectorCacheDep`
-(`api/connector_cache.py`); PATCH and DELETE evict the cached instance.
+(`api/connector/cache.py`); PATCH and DELETE evict the cached instance.

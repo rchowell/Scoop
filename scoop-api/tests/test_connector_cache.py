@@ -5,10 +5,9 @@ import uuid
 import pytest
 
 from api.connector import ConnectorError
-from api.connector_cache import ConnectorCache
-from api.db import SCHEMA, connect
-from tests.test_ast import lit
-from tests.test_sql import select
+from api.connector.cache import ConnectorCache
+from api.db import connect, init_db
+from tests.helpers import lit, select
 
 SELECT_1 = select(lit(1))
 
@@ -16,7 +15,7 @@ SELECT_1 = select(lit(1))
 @pytest.fixture
 def db(tmp_path):
     conn = connect(str(tmp_path / "app.sqlite3"))
-    conn.executescript(SCHEMA)
+    init_db(conn)
     yield conn
     conn.close()
 
@@ -46,7 +45,7 @@ def _closed(connector) -> bool:
 
 
 def test_miss_then_hit(db, cache, tmp_path):
-    id = _insert(db, options={"path": str(tmp_path / "x.db")})
+    id = _insert(db, options={"database": str(tmp_path / "x.db")})
     first = cache.get(id, db)
     assert first is not None
     assert cache.get(id, db) is first
@@ -56,7 +55,7 @@ def test_unknown_id(db, cache):
     assert cache.get(uuid.uuid4(), db) is None
 
 
-def test_factory_error_not_cached(db, cache):
+def test_create_error_not_cached(db, cache):
     id = _insert(db, kind="oracle")
     with pytest.raises(ConnectorError):
         cache.get(id, db)
@@ -64,7 +63,7 @@ def test_factory_error_not_cached(db, cache):
 
 
 def test_evict_closes_and_rebuilds(db, cache, tmp_path):
-    id = _insert(db, options={"path": str(tmp_path / "x.db")})
+    id = _insert(db, options={"database": str(tmp_path / "x.db")})
     first = cache.get(id, db)
     cache.evict(id)
     assert _closed(first)
@@ -74,7 +73,9 @@ def test_evict_closes_and_rebuilds(db, cache, tmp_path):
 
 
 def test_close_closes_all(db, cache, tmp_path):
-    ids = [_insert(db, options={"path": str(tmp_path / f"{i}.db")}) for i in range(2)]
+    ids = [
+        _insert(db, options={"database": str(tmp_path / f"{i}.db")}) for i in range(2)
+    ]
     connectors = [cache.get(id, db) for id in ids]
     cache.close()
     assert all(_closed(c) for c in connectors)

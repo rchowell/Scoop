@@ -43,7 +43,21 @@ is the `Connector` definition.
 
 ```python
 class Connector(ABC):
-    dialect: ClassVar[Dialect]  # Connector's SQL dialect
+    @classmethod
+    @abstractmethod
+    def kind(cls) -> str: ...                      # e.g. "postgres"
+
+    @classmethod
+    @abstractmethod
+    def display_name(cls) -> str: ...              # e.g. "PostgreSQL"
+
+    @classmethod
+    @abstractmethod
+    def options(cls) -> dict[str, Option]: ...     # what it takes to connect
+
+    @classmethod
+    @abstractmethod
+    def dialect(cls) -> Dialect: ...               # renders a Query AST as this backend's SQL
 
     @abstractmethod
     def list_tables(self, namespace: TablePath = ()) -> list[TablePath]:
@@ -53,19 +67,25 @@ class Connector(ABC):
     def get_table(self, path: TablePath) -> Table:
         """Describe a table or view; raises TableNotFoundError if it doesn't exist."""
 
+    @abstractmethod
     def execute(self, query: Query, *, page_size: int = 1000) -> Result:
         """Run `query`, returning pages of at most `page_size` rows."""
-        sql, params = self.dialect.compile(query)  # convert 'Query' structure to dialect-specific SQL
-        cursor = self._cursor()
-        cursor.execute(sql, params)
-        return Cursor(cursor, page_size, self._type_name)
-
-    @abstractmethod
-    def _cursor(self) -> Any:
-        """A fresh DB-API 2.0 cursor."""
 
     @abstractmethod
     def close(self) -> None: ...
+```
+
+Every backend today has a DB-API 2.0 driver, so they share one implementation,
+`DbApiConnector`, whose `execute` compiles the query with the dialect and runs it
+on a fresh cursor:
+
+```python
+class DbApiConnector(Connector):
+    def execute(self, query: Query, *, page_size: int = 1000) -> Result:
+        sql, params = self.dialect().compile(query)
+        cursor = self._cursor()
+        cursor.execute(sql, params)
+        return CursorResult(cursor, page_size, self._type_name)
 ```
 
 The `list_tables` and `get_table` APIs allow us to query the information_schema
@@ -108,62 +128,61 @@ class Result(ABC, Iterator[Page]):
         return self
 ```
 
-This `Connector` interface allows us to write per-database implementations which
-need only set a `dialect` and implement `list_tables`, `get_table`, `_cursor`,
-and `close`. You can see them all in these files,
+This lets us write per-database implementations which need only describe
+themselves with a few class attributes and implement `list_tables`,
+`get_table`, `_cursor`, and `close`. Each backend's file holds both its
+connector and its SQL dialect,
 
 ```
 api/
     connector/
-        base.py         # Connector, Result, ConnectorFactory
-        duckdb.py
-        mysql.py
-        postgres.py
-        sqlite.py
-        registry.py     # Factories keyed by kind
+        connector.py    # The interface: Connector, Result, Page, Table, errors
+        dbapi.py        # DbApiConnector: shared DB-API 2.0 implementation
+        options.py      # Option, and validating options against them
+        collect.py      # Result -> JSON-ready columnar rows
+        registry.py     # Connector classes keyed by kind; create_connector()
+        cache.py        # ConnectorCache: live connectors keyed by id
+        sqlite.py       # SQLiteDialect + SQLiteConnector
+        duckdb.py       # DuckDBDialect + DuckDBConnector
+        postgres.py     # PostgresDialect + PostgresConnector
+        mysql.py        # MySQLDialect + MySQLConnector
     sql/
-        dialect.py      # ANSI SQL Dialect visitor
-        dialects.py     # Per-backend overrides
+        dialect.py      # ANSI SQL Dialect visitor, with hooks for backends
         doc.py          # Wadler-style layout tree and renderer
-    visitor.py          # Visitor base class for the query AST
+        visitor.py      # Visitor base class for the query AST
+    models.py           # Generated from scoop-types
 ```
 
 We have a unified way to query with connectors, but how do we actually
-instantiate the connectors? This is where the `ConnectorFactory` comes in. The
-`ConnectorFactory` is responsible for unifying the instantiation of connectors
-to a single interface; a `ConnectorFactory` receives an arbitrary dict of
-options (JSON) and instantiates a connector instance. For example, here's the
-postgres connector factory.
+instantiate them? Each connector class declares its `kind`, a `display_name`,
+and the `options` it takes, and `create_connector(kind, options)` validates an arbitrary dict
+of options (JSON) against them before passing them to `__init__`. For example,
+here's the postgres connector's description.
 
 ```python
-class PostgresConnectorFactory(ConnectorFactory):
-    def kind(self) -> str:
-        return "postgres"
+class PostgresConnector(DbApiConnector):
+    kind = "postgres"
+    display_name = "PostgreSQL"
+    options = {
+        "host": Option(str, "Server hostname"),
+        "port": Option(int, "Server port", default=5432),
+        "user": Option(str, "Username"),
+        "password": Option(str, "Password", optional=True, secret=True),
+        "database": Option(str, "Database name"),
+    }
+    dialect = PostgresDialect()
 
-    def name(self) -> str:
-        return "PostgreSQL"
-
-    def options(self) -> dict[str, Option]:
-        return {
-            "host": Option(str, "Server hostname"),
-            "port": Option(int, "Server port", required=False, default=5432),
-            "user": Option(str, "Username"),
-            "password": Option(str, "Password", required=False, secret=True),
-            "dbname": Option(str, "Database name"),
-        }
-
-    def _connect(self, options: dict[str, Any]) -> Connector:
-        return PostgresConnector(make_conninfo(**options))
+    def __init__(self, database: str, **options: Any) -> None:
+        self._conn = psycopg.connect(dbname=database, autocommit=True, **options)
 ```
 
-This abstraction pays off in two ways. First, we can make a registry of all
-factories and create an HTTP API to list all available connectors. Because we
-have the `options()` method, then our UI can render all the options as a form.
-Second, we can save all options JSON into the application database along with
-the connector kind. Then when a query comes in we can check a `ConnectorCache`
-to see if we have an active connection, otherwise we can use the connector kind
-discriminant to lookup the factory in the registry, then use the options to
-instantiate the connector.
+This pays off in two ways. First, we can make a registry of all connector
+classes and create an HTTP API to list all available connectors. Because each
+declares its `options`, our UI can render them as a form. Second, we can save
+all options JSON into the application database along with the connector kind.
+Then when a query comes in we can check a `ConnectorCache` to see if we have an
+active connection, otherwise we use the connector kind to look up the class in
+the registry and create the connector from the stored options.
 
 ### Queries
 
@@ -190,7 +209,7 @@ Then common expressions such as:
   - `COALESCE`
   - `NULLIF`
 
-Turning the AST into SQL is a traversal, so `visitor.py` provides a
+Turning the AST into SQL is a traversal, so `sql/visitor.py` provides a
 `Visitor[C, R]` base class. The generated nodes are closed classes on which we
 cannot author an `accept` method, so the visitor dispatches on node type with
 `functools.singledispatchmethod`. State flows down the traversal through a
@@ -217,7 +236,7 @@ CRUD then we have the Connector APIs as HTTP APIs.
 
 ```
 GET    /v1/health                    # Service health and version
-GET    /v1/connections               # List connector kinds and their options
+GET    /v1/connector-kinds           # List connector kinds and their options
 GET    /v1/connectors                # List saved connectors
 POST   /v1/connectors                # Create a connector
 GET    /v1/connectors/{id}           # Get a connector
@@ -229,7 +248,7 @@ POST   /v1/connectors/{id}/execute   # Run a Query AST, returning columnar rows
 POST   /v1/connectors/{id}/generate  # Generate SQL from a prompt (SSE stream)
 ```
 
-The connections API returns a list of all supported connectors along with their
+The connector-kinds API returns a list of all supported connectors along with their
 options. The UI does NOT hardcode any connector information and it's all dynamic
 based on the available connectors.
 
@@ -238,7 +257,7 @@ based on the available connectors.
 The connector creation saves the connector and its options into the database,
 then when we call `execute` we lookup the connector `id` in an object cache. If
 the connector is missing from the cache, we instantiate it using the respective
-factory. The `execute` API then sends the `Query` AST to the connector, which
+connector class. The `execute` API then sends the `Query` AST to the connector, which
 compiles it with its dialect and returns the `Result` object described above.
 The HTTP layer converts the `Result` object into a `Page` of JSON results which
 the UI renders.
@@ -389,7 +408,7 @@ work with the cursor/Result API.
 I made no attempts for proper secret management. We cannot store secrets in the
 database. In a proper system, I would store placeholders, like keys, in the
 database and use a service like AWS Secrets Manager to load the secrets on the
-server during connector instantiation. All ConnectorFactory instances would have
+server during connector instantiation. `create_connector` would have
 access to a SecretsStore object on which they could resolve the placeholder keys
 to the actual secrets before doing a proper connect.
 

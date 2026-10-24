@@ -1,71 +1,24 @@
 import json
-from dataclasses import dataclass, field
 
 import pytest
 
 from api.connector import TableNotFoundError, create_connector
-from models import Query
-from tests.test_ast import binary, col, lit
-from tests.test_sql import table
+from api.models import Query
+from tests.backends import RESET
+from tests.helpers import binary, col, lit, run_sql, select, table
 
-SEED = [
-    "CREATE TABLE users (id INTEGER NOT NULL, name VARCHAR)",
-    "INSERT INTO users VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, NULL)",
-    "CREATE VIEW named_users AS SELECT * FROM users WHERE name IS NOT NULL",
-]
-RESET = ["DROP VIEW IF EXISTS named_users", "DROP TABLE IF EXISTS users"]
-
-
-@dataclass(frozen=True)
-class Backend:
-    prefix: tuple[str, ...]
-    types: tuple[str, str]  # expected native types of users.id, users.name
-    seed: list[str] = field(default_factory=lambda: SEED)
-
-
-BACKENDS = {
-    "sqlite": Backend(("main",), ("INTEGER", "VARCHAR")),
-    "duckdb": Backend(("memory", "main"), ("INTEGER", "VARCHAR")),
-    "postgres": Backend(("public",), ("integer", "character varying")),
-    "mysql": Backend(
-        ("test",),
-        ("int", "varchar"),
-        seed=[SEED[0].replace("VARCHAR", "VARCHAR(255)"), *SEED[1:]],
-    ),
-}
-
-
-@pytest.fixture(params=list(BACKENDS))
-def backend(request):
-    return request.param
+USERS = table("users")
 
 
 @pytest.fixture
-def conn(request, backend, tmp_path):
-    match backend:
-        case "sqlite":
-            options = {"path": str(tmp_path / "t.sqlite3")}
-        case "duckdb":
-            options = {}
-        case "postgres" | "mysql":
-            options = request.getfixturevalue(f"{backend}_options")
-    c = create_connector(backend, options)
-    # execute() only takes queries, so seed through the driver
-    cursor = c._cursor()
-    for stmt in [*RESET, *BACKENDS[backend].seed]:
-        cursor.execute(stmt)
-    cursor.close()
-    with c:
+def conn(spec, options):
+    with create_connector(spec.kind, options) as c:
+        run_sql(c, [*RESET, *spec.seed])
         yield c
 
 
-@pytest.fixture
-def spec(backend) -> Backend:
-    return BACKENDS[backend]
-
-
 def test_list_tables(conn, spec):
-    prefix = spec.prefix
+    prefix = spec.prefix  # a list: list_tables accepts any sequence
     assert conn.list_tables() == [(*prefix, "named_users"), (*prefix, "users")]
     assert conn.list_tables(prefix) == conn.list_tables()
     assert conn.list_tables(("nope",)) == []
@@ -75,10 +28,11 @@ def test_get_table(conn, spec):
     users = conn.get_table(("users",))
     assert users.path == (*spec.prefix, "users")
     assert users.kind == "table"
-    assert [(c.name, c.type, c.nullable) for c in users.columns] == [
+    assert [(c.name, c.type, c.nullable) for c in users.columns[:2]] == [
         ("id", spec.types[0], False),
         ("name", spec.types[1], True),
     ]
+    assert [c.name for c in users.columns] == ["id", "name", "avatar"]
     assert conn.get_table(users.path) == users
     assert conn.get_table(("named_users",)).kind == "view"
 
@@ -90,38 +44,35 @@ def test_get_table_missing(conn):
         conn.get_table(("a", "b", "c", "d"))
 
 
-def select(*columns, **clauses) -> Query:
-    return Query.model_validate(
-        {"select": [{"expr": c} for c in columns], "from": table("users"), **clauses}
-    )
+def users(*columns, **clauses) -> Query:
+    return select(*columns, from_=USERS, **clauses)
 
 
 BY_ID = [{"expr": col("id")}]
-ORDERED_IDS = select(col("id"), order_by=BY_ID)
-ORDERED_NAMES = select(col("name"), order_by=BY_ID)
+ORDERED_IDS = users(col("id"), order_by=BY_ID)
+ORDERED_NAMES = users(col("name"), order_by=BY_ID)
 
 
 def test_execute_pages(conn):
-    query = select(col("id"), col("name"), order_by=BY_ID)
+    query = users(col("id"), col("name"), order_by=BY_ID)
     with conn.execute(query, page_size=2) as result:
         assert [c.name for c in result.columns] == ["id", "name"]
         pages = list(result)
-    assert [len(p) for p in pages] == [2, 2, 1]
+    assert [len(p) for p in pages] == [2, 2]
     assert pages[0].data == {"id": [1, 2], "name": ["a", "b"]}
-    assert pages[2].data == {"id": [5], "name": [None]}
-    assert json.loads(json.dumps(pages[1].data)) == {"id": [3, 4], "name": ["c", "d"]}
+    assert json.loads(json.dumps(pages[1].data)) == {"id": [3, 4], "name": ["c", None]}
     assert list(result) == []
 
 
 def test_execute_empty(conn):
-    query = select(col("id"), col("name"), where=binary("lt", col("id"), lit(0)))
+    query = users(col("id"), col("name"), where=binary("lt", col("id"), lit(0)))
     with conn.execute(query) as result:
         assert [c.name for c in result.columns] == ["id", "name"]
         assert list(result) == []
 
 
 def test_execute_literals_are_bound(conn):
-    query = select(col("name"), where=binary("eq", col("id"), lit(3)))
+    query = users(col("name"), where=binary("eq", col("id"), lit(3)))
     with conn.execute(query) as result:
         assert [p.data for p in result] == [{"name": ["c"]}]
 
@@ -129,15 +80,15 @@ def test_execute_literals_are_bound(conn):
 def test_execute_dialect_syntax(conn):
     # MOD needs %% escaping on pyformat drivers; OFFSET without LIMIT and
     # NULLS FIRST need rewriting on SQLite and MySQL.
-    query = select(
+    query = users(
         binary("mod", col("id"), lit(2)),
         where=binary("gt", col("id"), lit(1)),
         order_by=BY_ID,
         offset=2,
     )
     with conn.execute(query) as result:
-        assert [p.data[result.columns[0].name] for p in result] == [[0, 1]]
-    query = select(
+        assert [p.data[result.columns[0].name] for p in result] == [[0]]
+    query = users(
         col("name"), order_by=[{"expr": col("name"), "nulls": "first"}], limit=2
     )
     with conn.execute(query) as result:
@@ -145,7 +96,7 @@ def test_execute_dialect_syntax(conn):
 
 
 def test_execute_duplicate_columns(conn):
-    query = select(
+    query = users(
         col("id"), col("id"), col("id"), where=binary("eq", col("id"), lit(1))
     )
     with conn.execute(query) as result:

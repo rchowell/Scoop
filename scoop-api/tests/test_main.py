@@ -1,31 +1,13 @@
-import pytest
-from fastapi.testclient import TestClient
-
-from api.config import Settings, get_settings
-from api.main import VERSION, app
-
-
-@pytest.fixture
-def client(tmp_path):
-    app.dependency_overrides[get_settings] = lambda: Settings(
-        db_path=str(tmp_path / "test.sqlite3")
-    )
-    with TestClient(app) as c:
-        yield c
-    app.dependency_overrides.clear()
-
-
-def test_hello(client):
-    resp = client.get("/")
-    assert resp.status_code == 200
-    assert resp.json() == {"message": "Hello, World!"}
+from api.config import get_settings
+from api.main import VERSION
+from tests.conftest import DB_FILE
 
 
 def test_health_uses_db(client, tmp_path):
     resp = client.get("/v1/health")
     assert resp.status_code == 200
     assert resp.json() == {"status": "ok", "version": VERSION}
-    assert (tmp_path / "test.sqlite3").exists()
+    assert (tmp_path / DB_FILE).exists()
 
 
 def test_cors_allows_app_origin(client):

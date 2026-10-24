@@ -2,9 +2,8 @@ import typing
 
 import pytest
 
-import models
-from api.visitor import Visitor
-from models import (
+from api import models
+from api.models import (
     BetweenExpr,
     BinaryExpr,
     BinaryOp,
@@ -30,7 +29,8 @@ from models import (
     UnaryOp,
     WhenClause,
 )
-from tests.test_ast import AGGREGATE, SCALARS
+from api.sql.visitor import Visitor
+from tests.helpers import AGGREGATE, SCALARS
 
 
 class KindVisitor(Visitor[list[str], str]):

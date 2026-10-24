@@ -2,76 +2,52 @@
 
 import pytest
 
-from api.connector import FACTORIES
-from tests.integration.conftest import BACKENDS
+from api.connector import CONNECTORS
+from api.models import Query
+from tests.backends import BACKENDS
+from tests.helpers import alias, binary, call, cast, col, lit, select, table
 
 pytestmark = pytest.mark.integration
 
 PROBLEM_JSON = "application/problem+json"
 
-# One SELECT per backend covering common scalar types, and the JSON it should produce.
+STAR = {"kind": "star"}
+USERS = table("users")
+BY_ID = [{"expr": col("id")}]
+
+# Per backend, (alias, expression, JSON value) covering common scalar types.
+_SCALARS = [
+    ("i", lit(1), 1),
+    ("f", lit(1.5), 1.5),
+    ("t", lit("x"), "x"),
+    ("n", lit(None), None),
+]
+_TEMPORAL = [
+    ("d", cast(lit("2024-01-02"), "DATE"), "2024-01-02"),
+    ("ts", cast(lit("2024-01-02 03:04:05"), "TIMESTAMP"), "2024-01-02T03:04:05"),
+    ("dec", cast(lit(1.25), "DECIMAL(5, 2)"), "1.25"),
+]
 TYPE_PROBES = {
-    "sqlite": (
-        "SELECT 1 AS i, 1.5 AS f, 'x' AS t, NULL AS n, TRUE AS bo, X'FF00' AS b",
-        {"i": 1, "f": 1.5, "t": "x", "n": None, "bo": 1, "b": "/wA="},
-    ),
-    "duckdb": (
-        (
-            "SELECT 1 AS i, 1.5::DOUBLE AS f, 'x' AS t, NULL AS n, TRUE AS bo, "
-            "DATE '2024-01-02' AS d, TIMESTAMP '2024-01-02 03:04:05' AS ts, "
-            r"1.25::DECIMAL(5, 2) AS dec, '\xFF\x00'::BLOB AS b, [1, 2] AS l"
-        ),
-        {
-            "i": 1,
-            "f": 1.5,
-            "t": "x",
-            "n": None,
-            "bo": True,
-            "d": "2024-01-02",
-            "ts": "2024-01-02T03:04:05",
-            "dec": "1.25",
-            "b": "/wA=",
-            "l": [1, 2],
-        },
-    ),
-    "postgres": (
-        (
-            "SELECT 1 AS i, 1.5::float8 AS f, 'x'::text AS t, NULL AS n, TRUE AS bo, "
-            "DATE '2024-01-02' AS d, TIMESTAMP '2024-01-02 03:04:05' AS ts, "
-            r"1.25::numeric(5, 2) AS dec, '\xff00'::bytea AS b, "
-            """'{"k": [1]}'::jsonb AS j"""
-        ),
-        {
-            "i": 1,
-            "f": 1.5,
-            "t": "x",
-            "n": None,
-            "bo": True,
-            "d": "2024-01-02",
-            "ts": "2024-01-02T03:04:05",
-            "dec": "1.25",
-            "b": "/wA=",
-            "j": {"k": [1]},
-        },
-    ),
-    "mysql": (
-        (
-            "SELECT 1 AS i, 1.5e0 AS f, 'x' AS t, NULL AS n, TRUE AS bo, "
-            "DATE '2024-01-02' AS d, TIMESTAMP '2024-01-02 03:04:05' AS ts, "
-            "CAST(1.25 AS DECIMAL(5, 2)) AS `dec`, X'FF00' AS b"
-        ),
-        {
-            "i": 1,
-            "f": 1.5,
-            "t": "x",
-            "n": None,
-            "bo": 1,
-            "d": "2024-01-02",
-            "ts": "2024-01-02T03:04:05",
-            "dec": "1.25",
-            "b": "/wA=",
-        },
-    ),
+    "sqlite": [*_SCALARS, ("bo", lit(True), 1)],
+    "duckdb": [
+        *_SCALARS,
+        ("bo", lit(True), True),
+        *_TEMPORAL,
+        ("l", call("list_value", lit(1), lit(2)), [1, 2]),
+    ],
+    "postgres": [
+        *_SCALARS,
+        ("bo", lit(True), True),
+        *_TEMPORAL,
+        ("j", cast(lit('{"k": [1]}'), "jsonb"), {"k": [1]}),
+    ],
+    "mysql": [
+        *_SCALARS,
+        ("bo", lit(True), 1),
+        ("d", cast(lit("2024-01-02"), "DATE"), "2024-01-02"),
+        ("ts", cast(lit("2024-01-02 03:04:05"), "DATETIME"), "2024-01-02T03:04:05"),
+        ("dec", cast(lit(1.25), "DECIMAL(5, 2)"), "1.25"),
+    ],
 }
 
 
@@ -79,8 +55,9 @@ def _url(id: str, suffix: str = "") -> str:
     return f"/v1/connectors/{id}{suffix}"
 
 
-def _execute(client, id, query, **body):
-    return client.post(_url(id, "/execute"), json={"query": query, **body})
+def _execute(client, id, query: Query, **body):
+    json = query.model_dump(mode="json", by_alias=True, exclude_unset=True)
+    return client.post(_url(id, "/execute"), json={"query": json, **body})
 
 
 def _assert_problem(resp, status: int, title: str) -> None:
@@ -91,17 +68,17 @@ def _assert_problem(resp, status: int, title: str) -> None:
 
 
 def test_every_kind_has_a_spec():
-    assert set(BACKENDS) == set(FACTORIES)
-    assert set(TYPE_PROBES) == set(FACTORIES)
+    assert set(BACKENDS) == set(CONNECTORS)
+    assert set(TYPE_PROBES) == set(CONNECTORS)
 
 
 # -- connector resource ------------------------------------------------------
 
 
 def test_kind_is_advertised(client, spec):
-    kinds = {k["kind"]: k for k in client.get("/v1/connections").json()["kinds"]}
+    kinds = {k["kind"]: k for k in client.get("/v1/connector-kinds").json()["kinds"]}
     assert [o["name"] for o in kinds[spec.kind]["options"]] == list(
-        FACTORIES[spec.kind].options()
+        CONNECTORS[spec.kind].options()
     )
 
 
@@ -174,13 +151,15 @@ def test_get_table_missing(client, target, path):
 # -- execute -----------------------------------------------------------------
 
 
-def test_execute_positional_params(client, spec, target):
-    resp = _execute(
-        client,
-        target,
-        f"SELECT id, name FROM users WHERE id > {spec.positional} ORDER BY id",
-        params=[1],
+def test_execute_literals_are_bound(client, spec, target):
+    query = select(
+        col("id"),
+        col("name"),
+        from_=USERS,
+        where=binary("gt", col("id"), lit(1)),
+        order_by=BY_ID,
     )
+    resp = _execute(client, target, query)
     assert resp.status_code == 200, resp.text
     result = resp.json()
     assert [c["name"] for c in result["columns"]] == ["id", "name"]
@@ -188,94 +167,79 @@ def test_execute_positional_params(client, spec, target):
     assert result["truncated"] is False
 
 
-def test_execute_named_params(client, spec, target):
-    resp = _execute(
-        client,
-        target,
-        f"SELECT name FROM users WHERE id = {spec.named('id')}",
-        params={"id": 3},
-    )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["data"] == {"name": ["c"]}
-
-
 @pytest.mark.parametrize(
     ("max_rows", "expected", "truncated"),
     [(2, [1, 2], True), (3, [1, 2, 3], True), (4, [1, 2, 3, 4], False)],
 )
 def test_execute_max_rows(client, target, max_rows, expected, truncated):
-    result = _execute(
-        client, target, "SELECT id FROM users ORDER BY id", max_rows=max_rows
-    ).json()
+    query = select(col("id"), from_=USERS, order_by=BY_ID)
+    result = _execute(client, target, query, max_rows=max_rows).json()
     assert result["data"] == {"id": expected}
     assert result["truncated"] is truncated
 
 
 def test_execute_empty_keeps_columns(client, target):
-    result = _execute(client, target, "SELECT id, name FROM users WHERE id < 0").json()
+    query = select(
+        col("id"), col("name"), from_=USERS, where=binary("lt", col("id"), lit(0))
+    )
+    result = _execute(client, target, query).json()
     assert [c["name"] for c in result["columns"]] == ["id", "name"]
     assert result["data"] == {"id": [], "name": []}
     assert result["truncated"] is False
 
 
 def test_execute_duplicate_columns(client, target):
-    result = _execute(client, target, "SELECT id, id FROM users WHERE id = 1").json()
+    query = select(
+        col("id"), col("id"), from_=USERS, where=binary("eq", col("id"), lit(1))
+    )
+    result = _execute(client, target, query).json()
     assert result["data"] == {"id": [1], "id_1": [1]}
 
 
 def test_execute_types(client, spec, target):
-    query, expected = TYPE_PROBES[spec.kind]
+    probes = TYPE_PROBES[spec.kind]
+    query = select(*(alias(expr, name) for name, expr, _ in probes))
     resp = _execute(client, target, query)
     assert resp.status_code == 200, resp.text
     result = resp.json()
-    assert [c["name"] for c in result["columns"]] == list(expected)
-    assert result["data"] == {k: [v] for k, v in expected.items()}
+    assert [c["name"] for c in result["columns"]] == [name for name, _, _ in probes]
+    assert result["data"] == {name: [value] for name, _, value in probes}
 
 
-def test_execute_blob_column(client, spec, target):
-    _execute(
-        client, target, f"UPDATE users SET avatar = {spec.blob_literal} WHERE id = 1"
-    )
-    result = _execute(client, target, "SELECT avatar FROM users ORDER BY id").json()
+def test_execute_blob_column(client, target):
+    query = select(col("avatar"), from_=USERS, order_by=BY_ID)
+    result = _execute(client, target, query).json()
     assert result["data"] == {"avatar": ["/wA=", None, None, None]}
-
-
-def test_writes_persist_across_requests(client, spec, target):
-    """Writes must be committed, not left pending on the cached connection."""
-    for stmt in [
-        "DROP TABLE IF EXISTS scratch",
-        "CREATE TABLE scratch (v INTEGER)",
-        "INSERT INTO scratch VALUES (7)",
-    ]:
-        resp = _execute(client, target, stmt)
-        assert resp.status_code == 200, resp.text
-
-    tables = client.get(_url(target, "/tables")).json()["tables"]
-    assert [*spec.prefix, "scratch"] in tables
-    assert _execute(client, target, "SELECT v FROM scratch").json()["data"] == {
-        "v": [7]
-    }
-    _execute(client, target, "DROP TABLE scratch")
 
 
 # -- errors ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "query", ["SELEC nope", "SELECT * FROM missing_table", "SELECT 1/"]
+    "query",
+    [
+        select(STAR, from_=table("missing_table")),
+        select(col("missing_column"), from_=USERS),
+        select(call("no_such_function", lit(1))),
+    ],
+    ids=["table", "column", "function"],
 )
-def test_execute_bad_sql(client, target, query):
+def test_execute_unknown_name(request, client, spec, target, query):
+    if spec.kind == "sqlite" and "column" in request.node.callspec.id:
+        # SQLite reads a double-quoted unknown identifier as a string literal.
+        pytest.xfail("SQLite DQS quirk: unknown quoted column becomes a string")
     _assert_problem(_execute(client, target, query), 400, "Query Failed")
 
 
-def test_execute_wrong_param_count(client, spec, target):
-    query = f"SELECT {spec.positional} AS a, {spec.positional} AS b"
-    _assert_problem(_execute(client, target, query, params=[1]), 400, "Query Failed")
+def test_execute_unsupported_syntax(client, target):
+    query = select(cast(lit(1), "INT; DROP TABLE users"))
+    _assert_problem(_execute(client, target, query), 400, "Query Failed")
 
 
 def test_connection_survives_failed_query(client, target):
-    _execute(client, target, "SELEC nope")
-    assert _execute(client, target, "SELECT 1 AS x").json()["data"] == {"x": [1]}
+    _execute(client, target, select(STAR, from_=table("missing_table")))
+    result = _execute(client, target, select(alias(lit(1), "x"))).json()
+    assert result["data"] == {"x": [1]}
 
 
 @pytest.mark.parametrize(
@@ -283,7 +247,7 @@ def test_connection_survives_failed_query(client, target):
     [
         ("get", "/tables", {}),
         ("get", "/table", {"params": {"path": "users"}}),
-        ("post", "/execute", {"json": {"query": "SELECT 1"}}),
+        ("post", "/execute", {"json": {"query": {"select": [{"expr": lit(1)}]}}}),
     ],
 )
 def test_unavailable_connector(client, spec, bad_options, method, suffix, kwargs):

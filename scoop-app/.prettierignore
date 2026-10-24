@@ -1,0 +1,5 @@
+# Generated or vendored by shadcn; keep their upstream style.
+src/components/ui
+src/hooks/use-mobile.ts
+src/lib/api/schema.d.ts
+pnpm-lock.yaml

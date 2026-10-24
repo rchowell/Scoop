@@ -3,7 +3,7 @@
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from models import ProblemDetail
+from api.models import ProblemDetail
 
 
 class Problem(Exception):

@@ -1,10 +1,13 @@
-"""ANSI SQL generation from the query AST, with hooks for backend dialects."""
+"""ANSI SQL generation from the query AST, with hooks for backend dialects.
+
+Each backend's Dialect subclass lives beside its connector in api/connector/.
+"""
 
 import re
 from dataclasses import dataclass
 from typing import Any
 
-from models import (
+from api.models import (
     BetweenExpr,
     BinaryExpr,
     BinaryOp,
@@ -29,9 +32,8 @@ from models import (
     UnaryOp,
     WhenClause,
 )
-
 from api.sql.doc import Doc, concat, group, join, line, nest, render, softline, text
-from api.visitor import Visitor
+from api.sql.visitor import Visitor
 
 INDENT = 2
 
@@ -351,3 +353,13 @@ class Dialect(Visitor[Ctx, Doc]):
         return group(
             node.name, "(", nest(INDENT, softline, distinct, args), softline, ")"
         )
+
+
+class PyformatDialect(Dialect):
+    """For drivers that use %s placeholders, where a literal % must be written %%."""
+
+    def placeholder(self, index: int) -> str:
+        return "%s"
+
+    def escape(self, sql: str) -> str:
+        return sql.replace("%", "%%")

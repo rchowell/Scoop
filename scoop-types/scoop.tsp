@@ -44,14 +44,14 @@ op ListConnectors(
 ): Page<Connector> | ProblemDetail;
 
 @get
-@route("/v1/connections")
+@route("/v1/connector-kinds")
 @doc("List available connector kinds and the options each one takes")
-op ListConnectorKinds(): ConnectorKindList;
+op ListConnectorKinds(): ConnectorKindList | ProblemDetail;
 
 @get
 @route("/v1/connectors/{id}")
 @doc("Get a single connector")
-op GetConnector(@path id: UUID): GetResponse<Connector>;
+op GetConnector(@path id: UUID): Connector | ProblemDetail;
 
 @post
 @route("/v1/connectors")
@@ -95,7 +95,7 @@ op GetConnectorTable(
   @query(#{ explode: true })
   @doc("Table path, one element per repeated param (e.g. ?path=main&path=users)")
   path: string[],
-): GetResponse<Table>;
+): Table | ProblemDetail;
 
 @post
 @route("/v1/connectors/{id}/execute")
@@ -123,14 +123,6 @@ op GenerateConnectorQuery(
 // ============================================================================
 // Helpers
 // ============================================================================
-
-alias GetResponse<T> = {
-  ...OkResponse;
-  ...Body<T>;
-} | {
-  ...NotFoundResponse;
-  ...ProblemDetail;
-};
 
 @doc("Paginated list response following RFC 8288 link relations")
 @friendlyName("{name}Page", T)
@@ -218,7 +210,7 @@ model Health {
 
 @doc("Database backend a connector talks to")
 enum ConnectorKind {
-  Sqlite: "sqlite",
+  SQLite: "sqlite",
   DuckDB: "duckdb",
   Postgres: "postgres",
   MySQL: "mysql",
@@ -239,7 +231,7 @@ model Connector {
   @visibility(Lifecycle.Read, Lifecycle.Create)
   kind: ConnectorKind;
 
-  @doc("Kind-specific options; see GET /v1/connections")
+  @doc("Kind-specific options; see GET /v1/connector-kinds")
   @visibility(Lifecycle.Read, Lifecycle.Create, Lifecycle.Update)
   options: Record<unknown>;
 
@@ -345,7 +337,7 @@ model GenerateRequest {
   @minLength(1)
   prompt: string;
 
-  @doc("The editor's full text, so the agent can refine an existing query")
+  @doc("The editor's query AST as JSON, minus the prompt, so the agent can refine it")
   context?: string;
 }
 

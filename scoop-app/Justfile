@@ -1,0 +1,12 @@
+default:
+    @just --list
+
+# Run the Next.js dev server on http://localhost:3000
+run:
+    pnpm dev
+
+codegen:
+    pnpm codegen
+
+format:
+    pnpm format

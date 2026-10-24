@@ -11,6 +11,7 @@ returning the errors to Claude to fix. The other tools are strict.
 
 import json
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 import anthropic
@@ -18,18 +19,23 @@ from anthropic import beta_tool
 from fastapi import Depends
 from pydantic import BaseModel, ValidationError
 
-from api.assist.sample import run_sample
 from api.config import Settings, get_settings
-from api.connector import Connector, TableNotFoundError, TablePath
-from api.problem import Problem
-from api.query import CLIENT_ERRORS
-from models import (
+from api.connector import (
+    CLIENT_ERRORS,
+    Column,
+    Connector,
+    TableNotFoundError,
+    TablePath,
+    collect,
+)
+from api.models import (
     AssistDoneEvent,
     AssistErrorEvent,
     AssistQueryEvent,
     AssistStatusEvent,
     Query,
 )
+from api.problem import Problem
 
 AssistEvent = AssistStatusEvent | AssistQueryEvent | AssistErrorEvent | AssistDoneEvent
 
@@ -38,6 +44,7 @@ MAX_LISTED_TABLES = 500
 # Below this many tables, the whole list goes in the first message to save a round trip.
 MAX_SEEDED_TABLES = 200
 SAMPLE_ROWS = 20
+MAX_CELL_CHARS = 200
 
 SYSTEM_PROMPT = """\
 You write queries for a database query editor. The user describes what they \
@@ -107,16 +114,46 @@ def _unknown_fields(node: Any, loc: str = "query") -> Iterator[str]:
             yield from _unknown_fields(item, f"{loc}[{i}]")
 
 
-def _path(path: TablePath) -> str:
+@dataclass(frozen=True)
+class Sample:
+    columns: list[Column]
+    rows: list[list[Any]]
+    truncated: bool
+
+
+def _clip(value: Any) -> Any:
+    if isinstance(value, str) and len(value) > MAX_CELL_CHARS:
+        return value[:MAX_CELL_CHARS] + "…"
+    return value
+
+
+def run_sample(
+    connector: Connector, query: Query, max_rows: int = SAMPLE_ROWS
+) -> Sample:
+    """Run `query`, returning at most `max_rows` rows with long text clipped.
+
+    The query's LIMIT is lowered to one past `max_rows` so the backend doesn't
+    compute rows nobody reads, while still showing whether more remained.
+    """
+    cap = max_rows + 1
+    limit = cap if query.limit is None else min(query.limit, cap)
+    capped = query.model_copy(update={"limit": limit})
+    with connector.execute(capped, page_size=max_rows) as result:
+        columns = result.columns
+        data, truncated = collect(result, max_rows)
+    rows = zip(*(data[c.name] for c in columns))
+    return Sample(columns, [[_clip(v) for v in row] for row in rows], truncated)
+
+
+def _path(path: TablePath | list[str]) -> str:
     return ".".join(path)
 
 
 class QueryToolkit:
     """The agent's tools, as plain methods over one connector."""
 
-    def __init__(self, connector: Connector, dialect: str) -> None:
+    def __init__(self, connector: Connector) -> None:
         self.connector = connector
-        self.dialect = dialect
         self.final_query: Query | None = None
 
     def parse_query(self, raw: Any) -> Query | str:
@@ -131,7 +168,7 @@ class QueryToolkit:
         if unknown := list(_unknown_fields(query)):
             return "\n".join(unknown)
         try:
-            self.connector.dialect.compile(query)
+            self.connector.dialect().compile(query)
         except ValueError as e:
             return str(e)
         return query
@@ -152,7 +189,7 @@ class QueryToolkit:
         try:
             table = self.connector.get_table(tuple(path))
         except TableNotFoundError:
-            return f"Error: no table {_path(tuple(path))}. Use list_tables to find it."
+            return f"Error: no table {_path(path)}. Use list_tables to find it."
         except CLIENT_ERRORS as e:
             return f"Error: {e}"
         return json.dumps(
@@ -171,7 +208,7 @@ class QueryToolkit:
         if isinstance(parsed, str):
             return f"Error: invalid query:\n{parsed}"
         try:
-            sample = run_sample(self.connector, parsed, SAMPLE_ROWS)
+            sample = run_sample(self.connector, parsed)
         except CLIENT_ERRORS as e:
             return f"Error: {e}"
         return json.dumps(
@@ -239,12 +276,12 @@ def step_label(name: str, input: dict[str, Any]) -> str:
         case "list_tables":
             namespace = input.get("namespace")
             return (
-                f"Listing tables in {'.'.join(namespace)}…"
+                f"Listing tables in {_path(namespace)}…"
                 if namespace
                 else "Listing tables…"
             )
         case "describe_table":
-            return f"Reading {'.'.join(input.get('path') or [])}…"
+            return f"Reading {_path(input.get('path') or [])}…"
         case "run_query":
             return "Sampling data…"
         case "submit_query":
@@ -264,7 +301,7 @@ def _first_message(toolkit: QueryToolkit, prompt: str, context: str | None) -> s
     else:
         tables = f"{len(paths)} tables; use list_tables with a namespace to browse."
     parts = [
-        f"<dialect>{toolkit.dialect}</dialect>",
+        f"<dialect>{toolkit.connector.kind()}</dialect>",
         f"<tables>\n{tables}\n</tables>",
     ]
     if context and context.strip() != prompt.strip():
@@ -282,30 +319,24 @@ class QueryAgent:
     def generate(
         self,
         connector: Connector,
-        dialect: str,
         prompt: str,
         context: str | None = None,
     ) -> Iterator[AssistEvent]:
-        toolkit = QueryToolkit(connector, dialect)
+        toolkit = QueryToolkit(connector)
         try:
             yield from self._run(toolkit, prompt, context)
         except anthropic.AuthenticationError:
-            yield AssistErrorEvent(
-                type="error", detail="ANTHROPIC_API_KEY was rejected."
-            )
+            yield AssistErrorEvent(detail="ANTHROPIC_API_KEY was rejected.")
         except anthropic.RateLimitError:
             yield AssistErrorEvent(
-                type="error",
                 detail="Rate limited by the Claude API; try again shortly.",
             )
         except anthropic.APIStatusError as e:
             yield AssistErrorEvent(
-                type="error", detail=f"Claude API error ({e.status_code}): {e.message}"
+                detail=f"Claude API error ({e.status_code}): {e.message}"
             )
         except anthropic.APIConnectionError:
-            yield AssistErrorEvent(
-                type="error", detail="Couldn't reach the Claude API."
-            )
+            yield AssistErrorEvent(detail="Couldn't reach the Claude API.")
 
     def _run(
         self, toolkit: QueryToolkit, prompt: str, context: str | None
@@ -327,25 +358,19 @@ class QueryAgent:
         )
         for message in runner:
             if message.stop_reason == "refusal":
-                yield AssistErrorEvent(
-                    type="error", detail="Claude declined to write this query."
-                )
+                yield AssistErrorEvent(detail="Claude declined to write this query.")
                 return
             for block in message.content:
                 if block.type == "tool_use":
-                    yield AssistStatusEvent(
-                        type="status", message=step_label(block.name, block.input)
-                    )
+                    yield AssistStatusEvent(message=step_label(block.name, block.input))
             # Run this turn's tools now (the runner reuses the result) so we can
             # stop as soon as a query is accepted, without another model turn.
             runner.generate_tool_call_response()
             if toolkit.final_query is not None:
-                yield AssistQueryEvent(type="query", query=toolkit.final_query)
-                yield AssistDoneEvent(type="done")
+                yield AssistQueryEvent(query=toolkit.final_query)
+                yield AssistDoneEvent()
                 return
-        yield AssistErrorEvent(
-            type="error", detail="The assistant stopped without writing a query."
-        )
+        yield AssistErrorEvent(detail="The assistant stopped without writing a query.")
 
 
 def get_query_agent(

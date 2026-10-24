@@ -1,25 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from typing import Any
 
 import pymysql
 from pymysql.constants import FIELD_TYPE
 
-from api.connector.base import (
-    Column,
-    Connector,
-    ConnectorFactory,
-    Option,
-    Table,
-    TableNotFoundError,
-    TablePath,
-)
-from api.sql import MySQLDialect
+from api.connector.connector import Table, TableNotFoundError, TablePath
+from api.connector.dbapi import DbApiConnector, within
+from api.connector.options import Option
+from api.models import BinaryExpr, BinaryOp, JoinType, NullsOrder, OrderItem
+from api.sql import PyformatDialect, UnsupportedSyntax
+from api.sql.dialect import COMPARE, Ctx
+from api.sql.doc import Doc, concat, group, join
 
-Params = Sequence[Any] | Mapping[str, Any] | None
-
-_KINDS = {"BASE TABLE": "table", "VIEW": "view", "SYSTEM VIEW": "view"}
 _SYSTEM_SCHEMAS = ("mysql", "sys", "performance_schema", "information_schema")
 
 # FIELD_TYPE has aliases (CHAR = TINY, INTERVAL = ENUM); keep the first name defined.
@@ -29,53 +22,84 @@ for _name, _code in vars(FIELD_TYPE).items():
         _TYPE_NAMES.setdefault(_code, _name.lower())
 
 
-class MySQLConnector(Connector):
+class MySQLDialect(PyformatDialect):
+    quote_char = "`"
+    no_limit = 2**64 - 1  # MySQL's documented "no limit"
+
+    def visit_binary_expr(self, node: BinaryExpr, ctx: Ctx) -> Doc:
+        if node.op is not BinaryOp.CONCAT:
+            return super().visit_binary_expr(node, ctx)
+        # || is logical OR unless PIPES_AS_CONCAT is set
+        args = [self._sub(node.left, ctx, 0), self._sub(node.right, ctx, 0)]
+        return group("CONCAT(", join(", ", args), ")")
+
+    def join_keyword(self, join_type: JoinType) -> str:
+        if join_type is JoinType.FULL:
+            raise UnsupportedSyntax("MySQL does not support FULL JOIN")
+        return super().join_keyword(join_type)
+
+    def visit_order_item(self, node: OrderItem, ctx: Ctx) -> Doc:
+        # No NULLS FIRST/LAST: sort on `x IS NULL` first (false, i.e. non-null, sorts low)
+        if node.nulls is None:
+            return super().visit_order_item(node, ctx)
+        # Render the key before the item so params stay in placeholder order
+        key = concat(
+            self._sub(node.expr, ctx, COMPARE + 1),
+            " IS NULL DESC" if node.nulls is NullsOrder.FIRST else " IS NULL",
+        )
+        item = super().visit_order_item(node.model_copy(update={"nulls": None}), ctx)
+        return concat(key, ", ", item)
+
+
+class MySQLConnector(DbApiConnector):
     """MySQL backend. Tables are addressed as (database, table)."""
 
-    dialect = MySQLDialect()
+    @classmethod
+    def kind(cls) -> str:
+        return "mysql"
 
-    def __init__(self, **connect_kwargs: Any) -> None:
-        self._conn = pymysql.connect(**connect_kwargs, autocommit=True)
+    @classmethod
+    def display_name(cls) -> str:
+        return "MySQL"
 
-    def _query(self, query: str, params: Params = None) -> list[tuple[Any, ...]]:
-        with self._conn.cursor() as cursor:
-            cursor.execute(query, params)
-            return list(cursor.fetchall())
+    @classmethod
+    def options(cls) -> dict[str, Option]:
+        return {
+            "host": Option(str, "Server hostname"),
+            "port": Option(int, "Server port", default=3306),
+            "user": Option(str, "Username"),
+            "password": Option(str, "Password", optional=True, secret=True),
+            "database": Option(str, "Database name"),
+        }
+
+    @classmethod
+    def dialect(cls) -> MySQLDialect:
+        return MySQLDialect()
+
+    @classmethod
+    def errors(cls) -> tuple[type[Exception], ...]:
+        return (pymysql.Error,)
+
+    def __init__(self, **options: Any) -> None:
+        self._conn = pymysql.connect(**options, autocommit=True)
 
     def list_tables(self, namespace: TablePath = ()) -> list[TablePath]:
-        rows = self._query(
-            "SELECT table_schema AS s, table_name AS t FROM information_schema.tables "
-            "WHERE table_schema NOT IN %s ORDER BY s, t",
+        rows = self._fetchall(
+            "SELECT table_schema, table_name FROM information_schema.tables "
+            "WHERE table_schema NOT IN %s ORDER BY 1, 2",
             (_SYSTEM_SCHEMAS,),
         )
-        return [tuple(r) for r in rows if tuple(r[: len(namespace)]) == namespace]
+        return within(rows, namespace)
 
     def get_table(self, path: TablePath) -> Table:
         if len(path) == 1:
-            ((database,),) = self._query("SELECT DATABASE()")
+            ((database,),) = self._fetchall("SELECT DATABASE()")
             if database is None:
                 raise TableNotFoundError(path)
             path = (database, *path)
         if len(path) != 2:
             raise TableNotFoundError(path)
-        rows = self._query(
-            "SELECT table_type AS k FROM information_schema.tables "
-            "WHERE table_schema = %s AND table_name = %s",
-            path,
-        )
-        if not rows:
-            raise TableNotFoundError(path)
-        columns = [
-            Column(name, data_type, is_nullable == "YES")
-            for name, data_type, is_nullable in self._query(
-                "SELECT column_name AS n, data_type AS t, is_nullable AS nl "
-                "FROM information_schema.columns "
-                "WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position",
-                path,
-            )
-        ]
-        kind = rows[0][0]
-        return Table(path, _KINDS.get(kind, kind.lower()), columns)
+        return self._describe(path, ("table_schema", "table_name"))
 
     def _cursor(self) -> Any:
         return self._conn.cursor()
@@ -85,23 +109,3 @@ class MySQLConnector(Connector):
 
     def close(self) -> None:
         self._conn.close()
-
-
-class MySQLConnectorFactory(ConnectorFactory):
-    def kind(self) -> str:
-        return "mysql"
-
-    def name(self) -> str:
-        return "MySQL"
-
-    def options(self) -> dict[str, Option]:
-        return {
-            "host": Option(str, "Server hostname"),
-            "port": Option(int, "Server port", required=False, default=3306),
-            "user": Option(str, "Username"),
-            "password": Option(str, "Password", required=False, secret=True),
-            "database": Option(str, "Database name"),
-        }
-
-    def _connect(self, options: dict[str, Any]) -> Connector:
-        return MySQLConnector(**options)

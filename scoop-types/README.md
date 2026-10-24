@@ -13,4 +13,4 @@ just build          # pnpm exec tsp compile scoop.tsp
 ```
 
 From the repo root, `just codegen` builds the spec and regenerates
-`scoop-api/models.py`.
+`scoop-api/api/models.py`.

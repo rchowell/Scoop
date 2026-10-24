@@ -1,5 +1,46 @@
+from typing import Any
+
 import pytest
 from docker.errors import DockerException
+from fastapi.testclient import TestClient
+
+from api.config import Settings, get_settings
+from api.connector import CONNECTORS
+from api.main import app
+from tests.backends import BACKENDS, Backend
+
+DB_FILE = "app.sqlite3"
+
+
+@pytest.fixture
+def client(tmp_path):
+    """A client for the app, backed by a fresh database in tmp_path / DB_FILE."""
+    app.dependency_overrides[get_settings] = lambda: Settings(
+        db_path=str(tmp_path / DB_FILE)
+    )
+    with TestClient(app) as c:
+        yield c
+    app.dependency_overrides.clear()
+
+
+# -- backends ----------------------------------------------------------------
+
+
+@pytest.fixture(params=list(CONNECTORS))
+def spec(request) -> Backend:
+    """Every registered connector kind; a kind without a Backend spec fails here."""
+    return BACKENDS[request.param]
+
+
+@pytest.fixture
+def options(spec, tmp_path, request) -> dict[str, Any]:
+    return spec.options(tmp_path, request, False)
+
+
+@pytest.fixture
+def bad_options(spec, tmp_path, request) -> dict[str, Any]:
+    """Options that validate but can't connect."""
+    return spec.options(tmp_path, request, True)
 
 
 def _container(cls):
@@ -20,7 +61,7 @@ def postgres_options():
         "port": int(container.get_exposed_port(5432)),
         "user": container.username,
         "password": container.password,
-        "dbname": container.dbname,
+        "database": container.dbname,
     }
     container.stop()
 

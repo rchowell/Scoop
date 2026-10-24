@@ -3,42 +3,30 @@ import sqlite3
 import duckdb
 import pytest
 
-from api.sql import (
-    Dialect,
-    DuckDBDialect,
-    MySQLDialect,
-    PostgresDialect,
-    SqliteDialect,
-    UnsupportedSyntax,
+from api.connector import DuckDBDialect, MySQLDialect, PostgresDialect, SQLiteDialect
+from api.models import Query
+from api.sql import Dialect, UnsupportedSyntax
+from tests.helpers import (
+    AGGREGATE,
+    SCALARS,
+    binary,
+    call,
+    col,
+    joined,
+    lit,
+    select,
+    table,
+    unary,
 )
-from models import Query
-from tests.test_ast import AGGREGATE, SCALARS, binary, call, col, lit
 
-DIALECTS = [Dialect, SqliteDialect, DuckDBDialect, PostgresDialect, MySQLDialect]
+DIALECTS = [Dialect, SQLiteDialect, DuckDBDialect, PostgresDialect, MySQLDialect]
 STAR = {"kind": "star"}
-
-
-def select(expr, **clauses):
-    return Query.model_validate({"select": [{"expr": expr}], **clauses})
 
 
 def compile_expr(dialect, expr):
     sql, params = dialect.compile(select(expr))
     assert sql.startswith("SELECT ")
     return sql.removeprefix("SELECT "), params
-
-
-def unary(op, operand):
-    return {"kind": "unary", "op": op, "operand": operand}
-
-
-def table(*path):
-    return {"kind": "table", "path": list(path)}
-
-
-def joined(join_type, left, right, on=None):
-    data = {"kind": "join", "join_type": join_type, "left": left, "right": right}
-    return data if on is None else {**data, "on": on}
 
 
 AGGREGATE_WIDE = """\
@@ -112,7 +100,7 @@ SCALARS_PARAMS = [0, "refund", "sale", 0, "test%"]
     ids=["aggregate-wide", "aggregate-narrow", "scalars-wide", "scalars-narrow"],
 )
 def test_golden(data, width, expected, params):
-    assert SqliteDialect().compile(Query.model_validate(data), width) == (
+    assert SQLiteDialect().compile(Query.model_validate(data), width) == (
         expected,
         params,
     )
@@ -172,7 +160,7 @@ def test_short_query_fits_on_one_line():
     ],
 )
 def test_precedence(expr, sql, value):
-    rendered, params = compile_expr(SqliteDialect(), expr)
+    rendered, params = compile_expr(SQLiteDialect(), expr)
     assert rendered == sql
     # The parenthesization means what the AST means
     assert sqlite3.connect(":memory:").execute(
@@ -203,7 +191,7 @@ def test_identifiers_are_quoted_and_escaped():
 @pytest.mark.parametrize(
     ("dialect", "sql"),
     [
-        (SqliteDialect(), '? % ? AS "5%"'),
+        (SQLiteDialect(), '? % ? AS "5%"'),
         (PostgresDialect(), '%s %% %s AS "5%%"'),
         (MySQLDialect(), "%s %% %s AS `5%%`"),
     ],
@@ -239,7 +227,7 @@ def test_mysql_nulls_order(nulls, sql):
     ("dialect", "sql"),
     [
         (Dialect(), 'SELECT * FROM "t" OFFSET 5'),
-        (SqliteDialect(), 'SELECT * FROM "t" LIMIT -1 OFFSET 5'),
+        (SQLiteDialect(), 'SELECT * FROM "t" LIMIT -1 OFFSET 5'),
         (MySQLDialect(), "SELECT * FROM `t` LIMIT 18446744073709551615 OFFSET 5"),
     ],
 )
@@ -333,5 +321,5 @@ def test_executes_on_sqlite():
         conn.execute(statement)
     # SQLite has no date type: CAST(... AS date) yields a number, so just check it runs
     for query in (UNPAGED, Query.model_validate(SCALARS)):
-        sql, params = SqliteDialect().compile(query)
+        sql, params = SQLiteDialect().compile(query)
         conn.execute(sql, params).fetchall()

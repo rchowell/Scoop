@@ -1,43 +1,50 @@
-from api.connector.base import (
+from api.connector.collect import collect
+from api.connector.connector import (
     Column,
     Connector,
     ConnectorError,
-    ConnectorFactory,
     InvalidOptionsError,
-    Option,
     Page,
     Result,
     Table,
     TableNotFoundError,
     TablePath,
 )
-from api.connector.duckdb import DuckDBConnector, DuckDBConnectorFactory
-from api.connector.mysql import MySQLConnector, MySQLConnectorFactory
-from api.connector.postgres import PostgresConnector, PostgresConnectorFactory
-from api.connector.registry import FACTORIES, create_connector, get_factory
-from api.connector.sqlite import SqliteConnector, SqliteConnectorFactory
+from api.connector.duckdb import DuckDBConnector, DuckDBDialect
+from api.connector.mysql import MySQLConnector, MySQLDialect
+from api.connector.options import Option, validate_options
+from api.connector.postgres import PostgresConnector, PostgresDialect
+from api.connector.registry import (
+    CLIENT_ERRORS,
+    CONNECTORS,
+    connector_class,
+    create_connector,
+)
+from api.connector.sqlite import SQLiteConnector, SQLiteDialect
 
 __all__ = [
-    "FACTORIES",
+    "CLIENT_ERRORS",
+    "CONNECTORS",
     "Column",
     "Connector",
     "ConnectorError",
-    "ConnectorFactory",
     "DuckDBConnector",
-    "DuckDBConnectorFactory",
+    "DuckDBDialect",
     "InvalidOptionsError",
     "MySQLConnector",
-    "MySQLConnectorFactory",
+    "MySQLDialect",
     "Option",
     "Page",
     "PostgresConnector",
-    "PostgresConnectorFactory",
+    "PostgresDialect",
     "Result",
-    "SqliteConnector",
-    "SqliteConnectorFactory",
+    "SQLiteConnector",
+    "SQLiteDialect",
     "Table",
     "TableNotFoundError",
     "TablePath",
+    "collect",
+    "connector_class",
     "create_connector",
-    "get_factory",
+    "validate_options",
 ]
